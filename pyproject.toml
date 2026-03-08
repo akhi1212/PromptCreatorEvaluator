@@ -1,0 +1,16 @@
+[project]
+name = "prompt-analyzer"
+version = "0.1.0"
+description = "Gradio app for evaluating LLM prompts using DeepEval metrics with OpenAI and Anthropic support"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "gradio>=5.0",
+    "deepeval>=2.0",
+    "python-dotenv>=1.0",
+    "openai>=1.0",
+    "anthropic>=0.40",
+]
+
+[project.scripts]
+prompt-analyzer = "app:main"
