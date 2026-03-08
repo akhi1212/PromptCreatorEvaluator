@@ -132,10 +132,22 @@ So: **one source of truth** in `evaluator.py` for both DeepEval and the UI.
 
 ### Prerequisites
 
-- Python >= 3.10
-- [uv](https://docs.astral.sh/uv/) package manager
+- Python >= 3.10 (uv will use or install a compatible Python)
+- **uv** — install once using the scripts below, or see [Installation](https://docs.astral.sh/uv/getting-started/installation/)
 
-### Install & Run
+### Run with scripts (Windows / Mac / Ubuntu)
+
+| Platform   | Command |
+|------------|--------|
+| **macOS / Linux / Ubuntu** | `./run.sh` |
+| **Windows**                | `run.bat` (double-click or run from Command Prompt/PowerShell) |
+
+- **First time:** The script installs uv (if missing), runs `uv sync` (creates `.venv` and installs deps), then starts the app.
+- **Next times:** Same command — syncs if needed and starts the app. No need to activate `.venv`; `uv run` uses it.
+
+Optional — install uv only: `./install_uv.sh` (Mac/Linux) or `install_uv.bat` (Windows).
+
+### Install & Run (manual)
 
 ```bash
 cd PromptAnalyzer
@@ -183,6 +195,10 @@ PromptAnalyzer/
 ├── evaluator.py      # DeepEval: METRIC_DEFS, run_evaluation(), refine_prompt(), GEval + LLMTestCase
 ├── styles.py         # CSS and HTML for results, refinement cards, metric definitions
 ├── prompt_library.py # Predefined templates (Cursor Workflow, Analysis)
+├── run.sh            # Run app on macOS / Linux / Ubuntu (installs uv if needed, then uv sync + run)
+├── run.bat           # Run app on Windows (installs uv if needed, then uv sync + run)
+├── install_uv.sh     # Optional: install uv only (Mac/Linux)
+├── install_uv.bat    # Optional: install uv only (Windows)
 ├── pyproject.toml    # Dependencies: gradio, deepeval, openai, anthropic, python-dotenv
 ├── README.md         # This file
 ├── prompts.json      # Auto-generated prompt storage
