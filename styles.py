@@ -96,6 +96,27 @@ button.primary:hover {
 .sidebar { border-right: 2px solid #e2e8f0 !important; }
 .dark .sidebar { border-right: 2px solid #334155 !important; }
 
+/* ── Prompt Builder section ── */
+.prompt-builder-section {
+    border: 2px solid #c4b5fd;
+    border-radius: 14px;
+    padding: 18px 20px 14px;
+    background: linear-gradient(135deg, #faf5ff, #eff6ff);
+    margin-bottom: 14px;
+}
+.dark .prompt-builder-section {
+    background: linear-gradient(135deg, #1e1b4b22, #1e3a5f22);
+    border-color: #4c1d95;
+}
+.prompt-builder-section .section-title {
+    font-weight: 800; font-size: 14px; color: #7c3aed;
+    margin-bottom: 4px; display: flex; align-items: center; gap: 6px;
+}
+.dark .prompt-builder-section .section-title { color: #a78bfa; }
+
+/* ── Framework radio buttons ── */
+.framework-radio label { font-weight: 700 !important; }
+
 /* ── Copy to clipboard button ── */
 #tpl-copy-btn {
     background: linear-gradient(135deg, #16a34a, #15803d) !important;

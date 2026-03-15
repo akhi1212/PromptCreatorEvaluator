@@ -37,6 +37,12 @@ from evaluator import (
     refine_prompt,
     run_evaluation,
 )
+from prompt_builder import (
+    build_prompt,
+    detect_framework,
+    render_detection_badge,
+    render_empty_badge,
+)
 from prompt_library import (
     CATEGORIES,
     VISIBLE_CATEGORIES,
@@ -652,8 +658,49 @@ def build_app() -> gr.Blocks:
             # ═══════════════════════════════════════════════════════════════
             with gr.Tab("Write New Prompt", id="tab-new-prompt"):
                 gr.Markdown(
-                    "Write your own prompt from scratch. Use category and full editor controls."
+                    "Describe your goal — the **PROMPT** or **CROFT** framework is "
+                    "auto-detected from your input. Click **Build Structured Prompt** to "
+                    "generate a well-formed prompt, then evaluate or refine it."
                 )
+
+                # ── Prompt Builder (top section) ──────────────────────────
+                with gr.Group(elem_classes=["prompt-builder-section"]):
+                    gr.HTML(
+                        '<div class="section-title">'
+                        "🧠 Prompt Builder (AI Fluency) — 4D Principles (Delegation · Description · Discernment · Diligence)"
+                        "</div>"
+                    )
+                    new_idea = gr.Textbox(
+                        label="What do you want to accomplish?",
+                        placeholder=(
+                            "e.g. 'Write a Python function that validates email addresses' "
+                            "or 'Explain the difference between REST and GraphQL APIs'"
+                        ),
+                        lines=3,
+                        info=(
+                            "Describe your intent in plain language. "
+                            "The framework is selected automatically — no LLM call needed."
+                        ),
+                    )
+                    new_framework_badge = gr.HTML(value=render_empty_badge())
+                    with gr.Row():
+                        new_framework_radio = gr.Radio(
+                            choices=["PROMPT", "CROFT"],
+                            value="PROMPT",
+                            label="Framework Override (auto-selected above)",
+                            elem_classes=["framework-radio"],
+                            info=(
+                                "PROMPT — Persona · Request · Output · Method · Purpose · Task  |  "
+                                "CROFT — Context · Role · Objective · Format · Tone"
+                            ),
+                        )
+                        new_build_btn = gr.Button(
+                            "✨ Build Structured Prompt",
+                            variant="primary",
+                            scale=0,
+                        )
+
+                # ── Full editor + evaluation ──────────────────────────────
                 with gr.Row():
                     with gr.Column(scale=1):
                         new_title = gr.Textbox(
@@ -663,8 +710,11 @@ def build_app() -> gr.Blocks:
                         )
                         new_text = gr.Textbox(
                             label="Prompt Text",
-                            placeholder="Write your full prompt here…",
-                            lines=10,
+                            placeholder=(
+                                "Your structured prompt will appear here after clicking "
+                                "'Build Structured Prompt', or write directly from scratch…"
+                            ),
+                            lines=12,
                         )
                         with gr.Row():
                             new_category = gr.Dropdown(
@@ -854,6 +904,30 @@ def build_app() -> gr.Blocks:
             fn=_assemble_and_refine,
             inputs=[tpl_dropdown] + tpl_inputs + [tpl_provider, tpl_model],
             outputs=[tpl_refinement_html],
+        )
+
+        # -- New prompt tab: framework auto-detection (no LLM) --
+        def _detect_and_update(idea: str) -> tuple[str, str]:
+            """Return (badge_html, framework_value) based on typed idea."""
+            fw, reason, confidence = detect_framework(idea)
+            badge = render_detection_badge(fw, reason, confidence)
+            return badge, fw
+
+        new_idea.change(
+            fn=_detect_and_update,
+            inputs=[new_idea],
+            outputs=[new_framework_badge, new_framework_radio],
+        )
+
+        # -- New prompt tab: build structured prompt (no LLM) --
+        def _build_structured_prompt(idea: str, framework: str) -> str:
+            """Generate a PROMPT or CROFT structured prompt from the user's idea."""
+            return build_prompt(idea, framework)  # type: ignore[arg-type]
+
+        new_build_btn.click(
+            fn=_build_structured_prompt,
+            inputs=[new_idea, new_framework_radio],
+            outputs=[new_text],
         )
 
         # -- New prompt tab: provider/model --
