@@ -242,6 +242,15 @@ def _score_bg(score: float) -> str:
     return "#fef2f2"
 
 
+def _escape(text: str) -> str:
+    """Basic HTML-escape for user-generated content."""
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
 def build_results_html(
     scores: dict[str, dict], provider: str, elapsed: float, model: str = ""
 ) -> str:
@@ -465,6 +474,176 @@ def build_output_results_html(
 
 
 # ---------------------------------------------------------------------------
+# Combined results panel (input + output in one view)
+# ---------------------------------------------------------------------------
+
+
+def build_combined_results_html(
+    input_scores: dict[str, dict],
+    output_scores: dict[str, dict],
+    provider: str,
+    input_elapsed: float,
+    output_elapsed: float,
+    model: str = "",
+    response_preview: str = "",
+) -> str:
+    """Render input and output evaluation scores in a single unified panel.
+
+    Shows an overall score ring, then input metrics section, then output
+    metrics section with the LLM response preview.
+    """
+    all_scores = {**input_scores, **output_scores}
+    if not all_scores:
+        return ""
+
+    total_elapsed = input_elapsed + output_elapsed
+    avg = sum(s["score"] for s in all_scores.values()) / max(len(all_scores), 1)
+    avg_color = _score_color(avg)
+    avg_pct = int(avg * 100)
+    model_label = f" / {model}" if model else ""
+    ring = f"background: conic-gradient({avg_color} {avg_pct}%, #e2e8f0 {avg_pct}%);"
+
+    html = f"""
+    <div style="font-family:'Inter',system-ui,sans-serif;">
+      <div style="display:flex;align-items:center;gap:20px;margin-bottom:22px;
+                  padding:22px 26px;border-radius:16px;
+                  background:linear-gradient(135deg,#ede9fe,#dbeafe,#ccfbf1);
+                  border:1px solid #c4b5fd;box-shadow:0 4px 20px rgba(124,58,237,0.1);">
+        <div style="width:84px;height:84px;border-radius:50%;{ring}
+                    display:flex;align-items:center;justify-content:center;flex-shrink:0;
+                    box-shadow:0 0 0 4px rgba(255,255,255,0.7);">
+          <div style="width:62px;height:62px;border-radius:50%;background:#fff;
+                      display:flex;align-items:center;justify-content:center;
+                      font-size:22px;font-weight:900;color:{avg_color};">
+            {avg_pct}%
+          </div>
+        </div>
+        <div>
+          <div style="font-size:21px;font-weight:800;color:#1e1b4b;">Overall Score</div>
+          <div style="color:#6b7280;font-size:13px;margin-top:5px;">
+            Provider: <strong style="color:#7c3aed;">{provider}{model_label}</strong>
+            &middot; {total_elapsed:.1f}s
+            &middot; {len(input_scores)} input + {len(output_scores)} output metrics
+          </div>
+        </div>
+      </div>
+    """
+
+    # ── Input metrics section ──
+    if input_scores:
+        input_avg = sum(s["score"] for s in input_scores.values()) / max(len(input_scores), 1)
+        input_avg_pct = int(input_avg * 100)
+        input_color = _score_color(input_avg)
+        html += f"""
+      <div style="display:flex;align-items:center;gap:10px;padding:12px 18px;margin-bottom:14px;
+                  border-radius:10px;background:linear-gradient(135deg,#ede9fe,#dbeafe);
+                  border:1px solid #c4b5fd;">
+        <span style="font-size:18px;">📥</span>
+        <span style="font-weight:800;font-size:14px;color:#4c1d95;">Input Quality</span>
+        <span style="margin-left:auto;font-weight:800;font-size:14px;color:{input_color};">{input_avg_pct}%</span>
+        <span style="font-size:11px;color:#6b7280;">{input_elapsed:.1f}s</span>
+      </div>
+        """
+        for name, info in input_scores.items():
+            html += _render_metric_card(name, info, _METRIC_LOOKUP)
+
+    # ── Output metrics section ──
+    if output_scores:
+        output_avg = sum(s["score"] for s in output_scores.values()) / max(len(output_scores), 1)
+        output_avg_pct = int(output_avg * 100)
+        output_color = _score_color(output_avg)
+
+        # Response preview
+        preview_block = ""
+        if response_preview:
+            preview = _escape(response_preview[:400])
+            if len(response_preview) > 400:
+                preview += "…"
+            preview_block = (
+                f'<div style="margin-bottom:14px;padding:14px 18px;border-radius:12px;'
+                f'background:#f0fdfa;border:1px solid #99f6e4;">'
+                f'<div style="font-size:12px;font-weight:700;color:#0d9488;margin-bottom:6px;">'
+                f'LLM RESPONSE PREVIEW</div>'
+                f'<pre style="font-size:12px;color:#134e4a;white-space:pre-wrap;'
+                f'word-break:break-word;margin:0;max-height:200px;overflow:auto;">{preview}</pre>'
+                f'</div>'
+            )
+
+        html += f"""
+      <div style="display:flex;align-items:center;gap:10px;padding:12px 18px;margin-bottom:14px;
+                  margin-top:20px;border-radius:10px;
+                  background:linear-gradient(135deg,#ccfbf1,#cffafe);
+                  border:1px solid #67e8f9;">
+        <span style="font-size:18px;">📤</span>
+        <span style="font-weight:800;font-size:14px;color:#164e63;">Output Quality</span>
+        <span style="margin-left:auto;font-weight:800;font-size:14px;color:{output_color};">{output_avg_pct}%</span>
+        <span style="font-size:11px;color:#6b7280;">{output_elapsed:.1f}s</span>
+      </div>
+      {preview_block}
+        """
+        for name, info in output_scores.items():
+            html += _render_metric_card(name, info, _OUTPUT_METRIC_LOOKUP)
+
+    html += "</div>"
+    return html
+
+
+def _render_metric_card(
+    name: str,
+    info: dict[str, Any],
+    lookup: dict[str, dict[str, Any]],
+) -> str:
+    """Render a single metric score card (used by both input and output sections)."""
+    sc = info["score"]
+    sc_color = _score_color(sc)
+    sc_bg = _score_bg(sc)
+    bar_w = max(int(sc * 100), 2)
+    icon = "✓" if info["passed"] else "✗"
+
+    mdef = lookup.get(name, {})
+    m_icon = mdef.get("icon", "")
+    accent = mdef.get("color", "#7c3aed")
+    short = mdef.get("short_def", "")
+    desc = mdef.get("description", "")
+
+    badge_bg = "#dcfce7" if info["passed"] else "#fee2e2"
+    badge_fg = "#15803d" if info["passed"] else "#b91c1c"
+
+    return f"""
+      <div style="margin-bottom:14px;padding:18px 20px;border-radius:14px;
+                  background:#fff;border:1px solid #e2e8f0;border-left:5px solid {accent};
+                  box-shadow:0 2px 8px rgba(0,0,0,0.04);">
+        <div style="display:flex;justify-content:space-between;align-items:center;">
+          <span style="font-weight:800;font-size:16px;color:{accent};">{m_icon} {name}</span>
+          <span style="color:{badge_fg};font-weight:800;font-size:14px;
+                       background:{badge_bg};padding:4px 14px;border-radius:20px;">
+            {icon} {sc:.0%}
+          </span>
+        </div>
+        <div style="font-size:12.5px;color:#64748b;margin-top:4px;font-style:italic;">{short}</div>
+        <div style="background:#f1f5f9;border-radius:6px;height:10px;margin:12px 0;overflow:hidden;">
+          <div style="background:linear-gradient(90deg,{accent},{sc_color});
+                      width:{bar_w}%;height:100%;border-radius:6px;"></div>
+        </div>
+        <div style="font-size:13.5px;color:#334155;line-height:1.6;margin-bottom:8px;
+                    padding:10px 14px;background:{sc_bg};border-radius:8px;
+                    border-left:3px solid {sc_color};">
+          {info['reason']}
+        </div>
+        <details style="cursor:pointer;margin-top:6px;">
+          <summary style="font-size:12.5px;font-weight:700;color:{accent};">
+            Learn more about this metric
+          </summary>
+          <p style="margin:8px 0 0;font-size:12.5px;color:#64748b;line-height:1.65;
+                    padding:8px 12px;background:#f8fafc;border-radius:8px;">
+            {desc}
+          </p>
+        </details>
+      </div>
+    """
+
+
+# ---------------------------------------------------------------------------
 # Refined prompt panel
 # ---------------------------------------------------------------------------
 
@@ -483,7 +662,11 @@ EMPTY_REFINEMENT_HTML = (
 )
 
 
-def build_refinement_html(refinement_text: str) -> str:
+def build_refinement_html(
+    refinement_text: str,
+    model: str = "",
+    provider: str = "",
+) -> str:
     """Render the LLM's refinement response as styled HTML.
 
     The LLM returns markdown with three sections:
@@ -496,12 +679,12 @@ def build_refinement_html(refinement_text: str) -> str:
 
     Args:
         refinement_text: Raw markdown from the LLM.
+        model:           Model used for refinement (shown as badge).
+        provider:        Provider name (controls badge color).
 
     Returns:
         Styled HTML string.
     """
-    import re
-
     sections = {
         "issues": "",
         "refined": "",
@@ -534,17 +717,23 @@ def build_refinement_html(refinement_text: str) -> str:
                 items.append(f"<li>{_escape(ln)}</li>")
         return "<ul style='margin:6px 0;padding-left:20px;'>" + "".join(items) + "</ul>" if items else ""
 
-    def _escape(text: str) -> str:
-        """Basic HTML-escape for user-generated content."""
-        return (
-            text.replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-        )
-
     refined_text = sections["refined"].strip()
     refined_escaped = _escape(refined_text)
     refined_display = refined_escaped.replace("\n", "<br>") if refined_escaped else "<em>No refined prompt generated.</em>"
+
+    provider_colors = {
+        "OpenAI": "#10a37f",
+        "Anthropic": "#d97706",
+        "Google": "#4285f4",
+    }
+    badge_color = provider_colors.get(provider, "#7c3aed")
+    model_badge = ""
+    if model and provider:
+        model_badge = (
+            f'<span style="background:{badge_color};color:#fff;padding:3px 10px;'
+            f'border-radius:12px;font-size:11px;font-weight:700;margin-left:8px;">'
+            f'{provider} · {model}</span>'
+        )
 
     html = '<div style="font-family:\'Inter\',system-ui,sans-serif;">'
 
@@ -567,7 +756,7 @@ def build_refinement_html(refinement_text: str) -> str:
                   background:#f0fdf4;border:1px solid #bbf7d0;border-left:5px solid #16a34a;">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
           <span style="font-weight:800;font-size:15px;color:#16a34a;">
-            ✅ Refined Prompt
+            ✅ Refined Prompt {model_badge}
           </span>
           <button onclick="
             var el = document.getElementById('{copy_id}');
@@ -592,6 +781,204 @@ def build_refinement_html(refinement_text: str) -> str:
         <div id="{copy_id}" style="font-size:14px;color:#14532d;line-height:1.7;
                     padding:12px 16px;background:#ffffff;border-radius:8px;
                     border:1px solid #dcfce7;white-space:pre-wrap;">
+          {refined_display}
+        </div>
+      </div>
+    """
+
+    if sections["changes"].strip():
+        html += f"""
+      <div style="margin-bottom:8px;padding:16px 20px;border-radius:12px;
+                  background:#eff6ff;border:1px solid #bfdbfe;border-left:5px solid #3b82f6;">
+        <div style="font-weight:800;font-size:15px;color:#2563eb;margin-bottom:8px;">
+          🔄 What Changed
+        </div>
+        <div style="font-size:13.5px;color:#1e3a5f;line-height:1.7;">
+          {_md_bullets(sections["changes"])}
+        </div>
+      </div>
+        """
+
+    html += "</div>"
+    return html
+
+
+def build_skill_refinement_html(
+    refinement_text: str,
+    model: str = "",
+    provider: str = "",
+    original_tokens: int = 0,
+    refined_tokens: int = 0,
+    original_cost: float = 0.0,
+    refined_cost: float = 0.0,
+) -> str:
+    """Render the LLM's skill/agent refinement response as styled HTML.
+
+    Similar to build_refinement_html but with skill-specific labels,
+    token-saving summary, and model badge.
+
+    Args:
+        refinement_text: Raw markdown from the LLM.
+        model:           Model used (shown as badge).
+        provider:        Provider name (controls badge color).
+        original_tokens: Token count of the original skill.
+        refined_tokens:  Token count after compression.
+        original_cost:   Estimated total cost of the original.
+        refined_cost:    Estimated total cost after compression.
+    """
+    sections = {
+        "issues": "",
+        "refined": "",
+        "changes": "",
+    }
+
+    current = None
+    for line in refinement_text.split("\n"):
+        lower = line.strip().lower()
+        if "issues found" in lower:
+            current = "issues"
+            continue
+        elif "refined skill" in lower or "refined agent" in lower:
+            current = "refined"
+            continue
+        elif "what changed" in lower:
+            current = "changes"
+            continue
+        if current:
+            sections[current] += line + "\n"
+
+    def _md_bullets(text: str) -> str:
+        items = []
+        for ln in text.strip().split("\n"):
+            ln = ln.strip()
+            if ln.startswith("- ") or ln.startswith("* "):
+                ln = ln[2:]
+            if ln:
+                items.append(f"<li>{_escape(ln)}</li>")
+        return "<ul style='margin:6px 0;padding-left:20px;'>" + "".join(items) + "</ul>" if items else ""
+
+    refined_text = sections["refined"].strip()
+    refined_escaped = _escape(refined_text)
+    refined_display = refined_escaped.replace("\n", "<br>") if refined_escaped else "<em>No refined skill generated.</em>"
+
+    # Model badge
+    provider_colors = {"OpenAI": "#10a37f", "Anthropic": "#d97706", "Google": "#4285f4"}
+    badge_color = provider_colors.get(provider, "#7c3aed")
+    model_badge = ""
+    if model and provider:
+        model_badge = (
+            f'<span style="background:{badge_color};color:#fff;padding:3px 10px;'
+            f'border-radius:12px;font-size:11px;font-weight:700;">'
+            f'{provider} · {model}</span>'
+        )
+
+    html = '<div style="font-family:\'Inter\',system-ui,sans-serif;">'
+
+    # Header badge
+    html += f"""
+      <div style="display:flex;align-items:center;gap:10px;padding:14px 20px;margin-bottom:16px;
+                  border-radius:12px;background:linear-gradient(135deg,#faf5ff,#ede9fe);
+                  border:2px solid #a78bfa;">
+        <span style="font-size:24px;">🤖</span>
+        <div style="flex:1;">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+            <span style="font-size:15px;font-weight:800;color:#6d28d9;">
+              Skill / Agent Refinement
+            </span>
+            {model_badge}
+          </div>
+          <div style="font-size:12px;color:#6b7280;margin-top:2px;">
+            Refined for quality <strong>&amp;</strong> token efficiency — optimized to save tokens without losing intent
+          </div>
+        </div>
+      </div>
+    """
+
+    # Token saving summary (only if we have data)
+    saved_tokens = original_tokens - refined_tokens
+    if original_tokens > 0 and saved_tokens > 0:
+        pct = saved_tokens / original_tokens * 100
+        saved_cost = original_cost - refined_cost
+        html += f"""
+      <div style="margin-bottom:16px;padding:16px 20px;border-radius:12px;
+                  background:linear-gradient(135deg,#ecfdf5,#f0fdf4);
+                  border:2px solid #86efac;">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;">
+          <span style="font-size:18px;">💰</span>
+          <span style="font-size:14px;font-weight:800;color:#166534;">
+            Token Savings
+          </span>
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;">
+          <div style="text-align:center;padding:8px;background:#fff;border-radius:8px;
+                      border:1px solid #bbf7d0;">
+            <div style="font-size:18px;font-weight:900;color:#6b7280;">{original_tokens:,}</div>
+            <div style="font-size:10px;color:#64748b;font-weight:600;margin-top:2px;">ORIGINAL</div>
+          </div>
+          <div style="text-align:center;padding:8px;background:#fff;border-radius:8px;
+                      border:1px solid #bbf7d0;">
+            <div style="font-size:18px;font-weight:900;color:#059669;">{refined_tokens:,}</div>
+            <div style="font-size:10px;color:#64748b;font-weight:600;margin-top:2px;">REFINED</div>
+          </div>
+          <div style="text-align:center;padding:8px;background:#fff;border-radius:8px;
+                      border:1px solid #bbf7d0;">
+            <div style="font-size:18px;font-weight:900;color:#059669;">▼ {saved_tokens:,} ({pct:.1f}%)</div>
+            <div style="font-size:10px;color:#64748b;font-weight:600;margin-top:2px;">TOKENS SAVED</div>
+          </div>
+          <div style="text-align:center;padding:8px;background:#fff;border-radius:8px;
+                      border:1px solid #bbf7d0;">
+            <div style="font-size:18px;font-weight:900;color:#059669;">${saved_cost:.6f}</div>
+            <div style="font-size:10px;color:#64748b;font-weight:600;margin-top:2px;">COST SAVED</div>
+          </div>
+        </div>
+      </div>
+        """
+
+    if sections["issues"].strip():
+        html += f"""
+      <div style="margin-bottom:14px;padding:16px 20px;border-radius:12px;
+                  background:#fef2f2;border:1px solid #fecaca;border-left:5px solid #ef4444;">
+        <div style="font-weight:800;font-size:15px;color:#dc2626;margin-bottom:8px;">
+          🔴 Issues Found
+        </div>
+        <div style="font-size:13.5px;color:#7f1d1d;line-height:1.7;">
+          {_md_bullets(sections["issues"])}
+        </div>
+      </div>
+        """
+
+    copy_id = f"skill-copy-{id(refined_text) % 100000}"
+    html += f"""
+      <div style="margin-bottom:14px;padding:18px 20px;border-radius:12px;
+                  background:#f5f3ff;border:1px solid #c4b5fd;border-left:5px solid #7c3aed;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+          <span style="font-weight:800;font-size:15px;color:#7c3aed;">
+            ✅ Refined Skill / Agent
+          </span>
+          <button onclick="
+            var el = document.getElementById('{copy_id}');
+            var t = el ? (el.innerText || el.textContent || '').trim() : '';
+            if (!t) return;
+            var ta = document.createElement('textarea');
+            ta.value = t;
+            ta.style.position = 'fixed';
+            ta.style.left = '-9999px';
+            document.body.appendChild(ta);
+            ta.select();
+            try {{ document.execCommand('copy'); }} catch(e) {{}}
+            document.body.removeChild(ta);
+            var btn = event.target;
+            btn.textContent = '✓ Copied!';
+            setTimeout(function(){{ btn.textContent = '📋 Copy'; }}, 2000);
+          " style="background:#7c3aed;color:#fff;border:none;border-radius:8px;
+                   padding:6px 16px;font-size:13px;font-weight:700;cursor:pointer;">
+            📋 Copy
+          </button>
+        </div>
+        <div id="{copy_id}" style="font-size:13px;color:#1e1b4b;line-height:1.7;
+                    padding:14px 18px;background:#ffffff;border-radius:8px;
+                    border:1px solid #e9e5f5;white-space:pre-wrap;
+                    max-height:500px;overflow:auto;font-family:'JetBrains Mono','Fira Code',monospace;">
           {refined_display}
         </div>
       </div>
@@ -874,6 +1261,231 @@ def build_cost_card_html(
         f'</div>'
         f'<div style="margin-top:12px;font-size:11px;color:#94a3b8;">'
         f'* Output cost estimated assuming response length ≈ input length</div>'
+        f'</div>'
+    )
+
+
+# ---------------------------------------------------------------------------
+# Token-saving suggestion card (used by Write New Prompt → Refine)
+# ---------------------------------------------------------------------------
+
+
+def build_token_saving_suggestion_html(
+    original_tokens: int,
+    original_cost: float,
+    compressed_tokens: int,
+    compressed_cost: float,
+    compressed_text: str,
+    reason: str,
+) -> str:
+    """Render a compact card showing the cheaper-prompt suggestion.
+
+    Displayed beneath the Refine output in the Write New Prompt tab.
+    Shows token/cost savings and the compressed prompt with a copy button.
+    """
+    saved_tokens = original_tokens - compressed_tokens
+    saved_cost = original_cost - compressed_cost
+    pct = (saved_tokens / original_tokens * 100) if original_tokens > 0 else 0
+
+    if saved_tokens <= 0:
+        return (
+            '<div style="padding:16px 20px;border-radius:12px;background:#f0fdf4;'
+            'border:1px solid #bbf7d0;margin-top:16px;font-size:13px;color:#166534;'
+            'font-weight:600;">'
+            '✅ Your prompt is already concise — no further compression available.'
+            '</div>'
+        )
+
+    copy_id = f"cheaper-copy-{id(compressed_text) % 100000}"
+    escaped = _escape(compressed_text)
+    display = escaped.replace("\n", "<br>") if escaped else ""
+
+    return (
+        f'<div style="margin-top:20px;border-radius:14px;padding:22px 26px;'
+        f'background:linear-gradient(135deg,#ecfdf5,#f0fdf4);'
+        f'border:2px solid #86efac;">'
+
+        f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;">'
+        f'<span style="font-size:20px;">💰</span>'
+        f'<span style="font-size:15px;font-weight:800;color:#166534;">'
+        f'Token Saving Summary</span>'
+        f'</div>'
+
+        f'<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;'
+        f'margin-bottom:16px;">'
+
+        f'<div style="text-align:center;padding:10px;background:#fff;border-radius:10px;'
+        f'border:1px solid #bbf7d0;">'
+        f'<div style="font-size:20px;font-weight:900;color:#059669;">▼ {saved_tokens:,}</div>'
+        f'<div style="font-size:11px;color:#64748b;font-weight:600;margin-top:2px;">'
+        f'TOKENS SAVED</div></div>'
+
+        f'<div style="text-align:center;padding:10px;background:#fff;border-radius:10px;'
+        f'border:1px solid #bbf7d0;">'
+        f'<div style="font-size:20px;font-weight:900;color:#059669;">{pct:.1f}%</div>'
+        f'<div style="font-size:11px;color:#64748b;font-weight:600;margin-top:2px;">'
+        f'REDUCTION</div></div>'
+
+        f'<div style="text-align:center;padding:10px;background:#fff;border-radius:10px;'
+        f'border:1px solid #bbf7d0;">'
+        f'<div style="font-size:20px;font-weight:900;color:#059669;">'
+        f'${saved_cost:.6f}</div>'
+        f'<div style="font-size:11px;color:#64748b;font-weight:600;margin-top:2px;">'
+        f'COST SAVED</div></div>'
+
+        f'</div>'
+
+        f'<div style="font-size:12px;color:#475569;margin-bottom:14px;'
+        f'padding:8px 12px;background:#fff;border-radius:8px;border:1px solid #e5e7eb;">'
+        f'<strong>What changed:</strong> {_escape(reason)}</div>'
+
+        f'<div style="padding:16px 20px;border-radius:12px;background:#fff;'
+        f'border:1px solid #bbf7d0;">'
+        f'<div style="display:flex;justify-content:space-between;align-items:center;'
+        f'margin-bottom:8px;">'
+        f'<span style="font-weight:700;font-size:13px;color:#166534;">'
+        f'Optimized Prompt (ready to use)</span>'
+        f'<button onclick="'
+        f"var el=document.getElementById('{copy_id}');"
+        f"var t=el?(el.innerText||el.textContent||'').trim():'';"
+        f"if(!t)return;"
+        f"var ta=document.createElement('textarea');"
+        f"ta.value=t;ta.style.position='fixed';ta.style.left='-9999px';"
+        f"document.body.appendChild(ta);ta.select();"
+        f"try{{document.execCommand('copy');}}catch(e){{}}"
+        f"document.body.removeChild(ta);"
+        f"var btn=event.target;btn.textContent='✓ Copied!';"
+        f"setTimeout(function(){{btn.textContent='📋 Copy';}},2000);"
+        f'" style="background:#059669;color:#fff;border:none;border-radius:8px;'
+        f'padding:5px 14px;font-size:12px;font-weight:700;cursor:pointer;">'
+        f'📋 Copy</button></div>'
+        f'<div id="{copy_id}" style="font-size:13px;color:#14532d;line-height:1.7;'
+        f'white-space:pre-wrap;max-height:300px;overflow:auto;">'
+        f'{display}</div>'
+        f'</div>'
+
+        f'</div>'
+    )
+
+
+# ---------------------------------------------------------------------------
+# All-models pricing comparison table (Write New Prompt → Refine)
+# ---------------------------------------------------------------------------
+
+
+def build_all_models_pricing_html(
+    model_rows: list[dict],
+    selected_model: str,
+) -> str:
+    """Render a comparison table showing token costs across all available models.
+
+    Each row: model name, provider badge, input tokens, input cost, output cost,
+    total cost, and a savings indicator vs the selected model.
+
+    Args:
+        model_rows: List of dicts, each with keys:
+            model, provider, tokens, input_cost, output_cost, total_cost, available
+        selected_model: The model the user chose (highlighted row).
+    """
+    rows_html = ""
+    cheapest_total = min(
+        (r["total_cost"] for r in model_rows if r["available"]),
+        default=0,
+    )
+
+    provider_colors = {
+        "OpenAI":    "#10a37f",
+        "Anthropic": "#d97706",
+        "Google":    "#4285f4",
+    }
+
+    for r in model_rows:
+        accent = provider_colors.get(r["provider"], "#7c3aed")
+        is_selected = r["model"] == selected_model
+        is_cheapest = r["available"] and r["total_cost"] == cheapest_total
+
+        bg = "#ede9fe" if is_selected else ("#f0fdf4" if is_cheapest else "#fff")
+        border = f"2px solid {accent}" if is_selected else "1px solid #e5e7eb"
+
+        badge = (
+            f'<span style="background:{accent};color:#fff;padding:2px 8px;'
+            f'border-radius:12px;font-size:10px;font-weight:700;">'
+            f'{r["provider"]}</span>'
+        )
+
+        if not r["available"]:
+            cost_cells = (
+                '<td style="padding:8px 12px;color:#94a3b8;font-size:12px;" '
+                'colspan="4"><em>API key not configured</em></td>'
+            )
+        else:
+            labels = []
+            if is_selected:
+                labels.append(
+                    '<span style="background:#7c3aed;color:#fff;padding:1px 6px;'
+                    'border-radius:8px;font-size:9px;font-weight:700;">SELECTED</span>'
+                )
+            if is_cheapest:
+                labels.append(
+                    '<span style="background:#059669;color:#fff;padding:1px 6px;'
+                    'border-radius:8px;font-size:9px;font-weight:700;">CHEAPEST</span>'
+                )
+            label_html = " ".join(labels)
+
+            cost_cells = (
+                f'<td style="padding:8px 12px;text-align:right;font-size:13px;'
+                f'font-weight:700;color:#0f172a;">{r["tokens"]:,}</td>'
+                f'<td style="padding:8px 12px;text-align:right;font-size:13px;'
+                f'color:#059669;">${r["input_cost"]:.6f}</td>'
+                f'<td style="padding:8px 12px;text-align:right;font-size:13px;'
+                f'color:#d97706;">${r["output_cost"]:.6f}</td>'
+                f'<td style="padding:8px 12px;text-align:right;font-size:13px;'
+                f'font-weight:800;color:#7c3aed;">${r["total_cost"]:.6f} {label_html}</td>'
+            )
+
+        rows_html += (
+            f'<tr style="background:{bg};border-bottom:{border};">'
+            f'<td style="padding:8px 12px;font-size:13px;font-weight:600;">'
+            f'{badge} {_escape(r["model"])}</td>'
+            f'{cost_cells}'
+            f'</tr>'
+        )
+
+    return (
+        f'<div style="margin-top:20px;border-radius:14px;padding:22px 26px;'
+        f'background:linear-gradient(135deg,#faf5ff,#eff6ff);'
+        f'border:2px solid #c4b5fd;">'
+
+        f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:16px;">'
+        f'<span style="font-size:20px;">📊</span>'
+        f'<div>'
+        f'<span style="font-size:15px;font-weight:800;color:#4c1d95;">'
+        f'All Models — Token & Cost Comparison</span>'
+        f'<div style="font-size:11px;color:#6b7280;margin-top:2px;">'
+        f'Costs calculated for the <strong>refined prompt</strong> across every model</div>'
+        f'</div></div>'
+
+        f'<div style="overflow-x:auto;">'
+        f'<table style="width:100%;border-collapse:collapse;border-radius:10px;'
+        f'overflow:hidden;font-family:Inter,system-ui,sans-serif;">'
+        f'<thead><tr style="background:#4c1d95;color:#ffffff;">'
+        f'<th style="padding:12px 14px;text-align:left;font-size:13px;font-weight:800;'
+        f'color:#ffffff;letter-spacing:0.5px;">Model</th>'
+        f'<th style="padding:12px 14px;text-align:right;font-size:13px;font-weight:800;'
+        f'color:#ffffff;letter-spacing:0.5px;">Tokens</th>'
+        f'<th style="padding:12px 14px;text-align:right;font-size:13px;font-weight:800;'
+        f'color:#ffffff;letter-spacing:0.5px;">Input Cost</th>'
+        f'<th style="padding:12px 14px;text-align:right;font-size:13px;font-weight:800;'
+        f'color:#ffffff;letter-spacing:0.5px;">Output Cost*</th>'
+        f'<th style="padding:12px 14px;text-align:right;font-size:13px;font-weight:800;'
+        f'color:#ffffff;letter-spacing:0.5px;">Total Est.</th>'
+        f'</tr></thead>'
+        f'<tbody>{rows_html}</tbody>'
+        f'</table></div>'
+
+        f'<div style="margin-top:10px;font-size:11px;color:#94a3b8;">'
+        f'* Output cost estimated assuming response length ≈ input length. '
+        f'Configure missing API keys in the Settings tab.</div>'
         f'</div>'
     )
 
