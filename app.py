@@ -2,7 +2,7 @@
 PromptAnalyzer — Gradio app for evaluating LLM prompts using DeepEval.
 
 Tabs:
-  1. Analyze Prompt File  — upload/paste, token cost, INPUT metrics, OUTPUT metrics, cheaper alt
+  1. Analyze Prompt File  — upload/paste, token cost, INPUT + OUTPUT metrics, save/refine, cheaper alt
   2. Write New Prompt     — free-form editor with PROMPT/CROFT framework auto-detection
   3. Settings             — API key configuration
 
@@ -38,9 +38,9 @@ from config.pricing import (
     PROVIDER_FOR_MODEL,
 )
 from evaluator import (
-    generate_prompt_response,
-    run_evaluation,
-    run_output_evaluation,
+    refine_prompt,
+    refine_skill,
+    run_full_evaluation,
 )
 from prompt_builder import (
     build_prompt,
@@ -53,12 +53,14 @@ from styles import (
     APP_CSS,
     EMPTY_RESULTS_HTML,
     HEADER_HTML,
-    build_comparison_html,
+    build_all_models_pricing_html,
+    build_combined_results_html,
     build_cost_card_html,
     build_metric_cards_html,
     build_output_metric_cards_html,
-    build_output_results_html,
-    build_results_html,
+    build_refinement_html,
+    build_skill_refinement_html,
+    build_token_saving_suggestion_html,
 )
 
 ENV_FILE = Path(".env")
@@ -118,11 +120,7 @@ SUPPORTED_EXTENSIONS = {".md", ".txt", ".py", ".yaml", ".yml", ".json"}
 
 
 def _load_prompt_text(uploaded_file: Any, pasted_text: str) -> tuple[str, str]:
-    """Resolve prompt text from whichever input was used.
-
-    Priority: uploaded file → pasted text.
-    Returns: (text, error_message)
-    """
+    """Resolve prompt text from whichever input was used."""
     if uploaded_file is not None:
         try:
             path = Path(
@@ -165,6 +163,14 @@ def _pricing_for_model(text: str, model: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# State: store the last analyzed prompt text per session
+# ---------------------------------------------------------------------------
+
+
+_last_prompt_text: dict[str, str] = {}
+
+
+# ---------------------------------------------------------------------------
 # Main analysis pipeline
 # ---------------------------------------------------------------------------
 
@@ -173,28 +179,30 @@ def analyze_prompt(
     uploaded_file: Any,
     pasted_text: str,
     selected_model: str,
-) -> tuple[str, str, str, str]:
+) -> tuple[str, str]:
     """Full analysis pipeline.
 
     Steps:
         1. Load prompt text
         2. Token count + pricing (cost card)
-        3. INPUT evaluation  — score the prompt quality
-        4. Generate LLM response
-        5. OUTPUT evaluation — score the response quality
-        6. Generate cheaper alternative + comparison
+        3. Full evaluation (input + output metrics)
+
+    The cheaper-alternative comparison is handled separately by
+    the Refine button, so we don't duplicate it here.
 
     Returns:
-        (cost_html, input_quality_html, output_quality_html, comparison_html)
+        (cost_html, combined_quality_html)
     """
     text, err = _load_prompt_text(uploaded_file, pasted_text)
     if err:
         error_html = f"<p style='color:#dc2626;font-weight:600;'>{err}</p>"
-        return error_html, "", "", ""
+        return error_html, ""
 
     provider = PROVIDER_FOR_MODEL.get(selected_model, "OpenAI")
 
-    # ── Step 1: Token cost card ────────────────────────────────────────────
+    _last_prompt_text["analyze"] = text
+
+    # Step 1: Token cost card
     orig_pricing = _pricing_for_model(text, selected_model)
     cost_html = build_cost_card_html(
         model=selected_model,
@@ -204,84 +212,153 @@ def analyze_prompt(
         output_cost=orig_pricing["output_cost"],
     )
 
-    # ── Step 2: INPUT evaluation (prompt quality) ──────────────────────────
-    start = time.time()
-    input_scores: dict = {}
-    try:
-        input_scores = run_evaluation(text, provider, selected_model)
-    except Exception as exc:
-        tb = traceback.format_exc()
-        cost_html += (
-            f"<pre style='color:#dc2626;font-size:12px;'>"
-            f"Input evaluation failed:\n{exc}\n\n{tb}</pre>"
-        )
-    input_elapsed = time.time() - start
+    # Step 2: Full evaluation (input metrics + LLM response + output metrics)
+    eval_result = run_full_evaluation(text, provider, selected_model)
 
-    input_quality_html = (
-        build_results_html(input_scores, provider, input_elapsed, selected_model)
-        if input_scores else ""
+    for e in eval_result["errors"]:
+        cost_html += (
+            f"<pre style='color:#dc2626;font-size:12px;'>{e}</pre>"
+        )
+
+    combined_html = build_combined_results_html(
+        input_scores=eval_result["input_scores"],
+        output_scores=eval_result["output_scores"],
+        provider=provider,
+        input_elapsed=eval_result["input_elapsed"],
+        output_elapsed=eval_result["output_elapsed"],
+        model=selected_model,
+        response_preview=eval_result["response_text"],
     )
 
-    # ── Step 3: Generate actual LLM response ───────────────────────────────
-    response_text = ""
-    try:
-        response_text = generate_prompt_response(text, provider, selected_model)
-    except Exception as exc:
-        response_text = f"[Could not generate response: {exc}]"
+    return cost_html, combined_html
 
-    # ── Step 4: OUTPUT evaluation (response quality) ───────────────────────
-    start = time.time()
-    output_scores: dict = {}
+
+# ---------------------------------------------------------------------------
+# Analyze tab: Refine handler
+# ---------------------------------------------------------------------------
+
+
+def refine_analyzed_prompt(
+    uploaded_file: Any,
+    pasted_text: str,
+    selected_model: str,
+    context: str = "",
+) -> str:
+    """Refine the skill/agent file from the Analyze tab.
+
+    Pipeline:
+      1. Compress — generate a token-efficient version of the skill
+      2. Refine  — improve quality of the compressed version
+      3. Display — show token savings + refined skill
+
+    Treats the uploaded content as a Skill or Agent definition — not a
+    generic prompt.
+    """
+    text, err = _load_prompt_text(uploaded_file, pasted_text)
+    if err:
+        return f"<p style='color:#dc2626;font-weight:600;'>{err}</p>"
+
+    original = text.strip()
+    provider = PROVIDER_FOR_MODEL.get(selected_model, "OpenAI")
+
+    # Step 1: Compress for token savings
+    compressed = original
     try:
-        output_scores = run_output_evaluation(text, response_text, provider, selected_model)
-    except Exception as exc:
-        tb = traceback.format_exc()
-        output_scores = {}
-        cost_html += (
-            f"<pre style='color:#dc2626;font-size:12px;'>"
-            f"Output evaluation failed:\n{exc}\n\n{tb}</pre>"
+        compressed, _reason = generate_cheaper_alternative(
+            original, provider, selected_model,
         )
-    output_elapsed = time.time() - start
-
-    output_quality_html = (
-        build_output_results_html(
-            output_scores,
-            provider,
-            output_elapsed,
-            selected_model,
-            actual_output_preview=response_text,
-        )
-        if output_scores else ""
-    )
-
-    # ── Step 5: Cheaper alternative + comparison ───────────────────────────
-    try:
-        alt_text, reason = generate_cheaper_alternative(text, provider, selected_model)
-    except Exception as exc:
-        alt_text, reason = text, f"Could not generate alternative: {exc}"
-
-    alt_pricing = _pricing_for_model(alt_text, selected_model)
-    alt_scores: dict = {}
-    try:
-        alt_scores = run_evaluation(alt_text, provider, selected_model)
     except Exception:
         pass
 
-    comparison_html = build_comparison_html(
-        original_text=text,
-        original_tokens=orig_pricing["tokens"],
-        original_input_cost=orig_pricing["input_cost"],
-        original_output_cost=orig_pricing["output_cost"],
-        original_scores=input_scores,
-        alt_text=alt_text,
-        alt_tokens=alt_pricing["tokens"],
-        alt_input_cost=alt_pricing["input_cost"],
-        alt_output_cost=alt_pricing["output_cost"],
-        alt_scores=alt_scores,
-        reason=reason,
+    orig_pricing = _pricing_for_model(original, selected_model)
+    comp_pricing = _pricing_for_model(compressed, selected_model)
+
+    # Step 2: Refine the compressed version
+    try:
+        raw = refine_skill(
+            compressed, provider, selected_model, context=context.strip(),
+        )
+        return build_skill_refinement_html(
+            raw,
+            model=selected_model,
+            provider=provider,
+            original_tokens=orig_pricing["tokens"],
+            refined_tokens=comp_pricing["tokens"],
+            original_cost=orig_pricing["input_cost"] + orig_pricing["output_cost"],
+            refined_cost=comp_pricing["input_cost"] + comp_pricing["output_cost"],
+        )
+    except Exception as exc:
+        tb = traceback.format_exc()
+        return f"<pre style='color:#dc2626;'>Refinement failed:\n{exc}\n\n{tb}</pre>"
+
+
+# ---------------------------------------------------------------------------
+# Analyze tab: Save handler
+# ---------------------------------------------------------------------------
+
+
+def view_skill_content(
+    uploaded_file: Any, pasted_text: str,
+) -> tuple[str, str, Any, str]:
+    """Display the full skill/agent content for viewing/copying.
+
+    Returns:
+        (content_text, preview_html, save_btn_update, status_msg)
+    """
+    text, err = _load_prompt_text(uploaded_file, pasted_text)
+    if err:
+        return (
+            gr.update(value="", visible=False),
+            f"<p style='color:#dc2626;font-weight:600;'>{err}</p>",
+            gr.update(visible=False),
+            "",
+        )
+    if not text.strip():
+        return (
+            gr.update(value="", visible=False),
+            "<p style='color:#dc2626;font-weight:600;'>No content to display.</p>",
+            gr.update(visible=False),
+            "",
+        )
+
+    line_count = len(text.strip().splitlines())
+    char_count = len(text.strip())
+    preview_html = (
+        f'<div style="display:flex;align-items:center;gap:10px;padding:12px 18px;'
+        f'border-radius:10px;background:linear-gradient(135deg,#f0fdf4,#ecfdf5);'
+        f'border:1px solid #bbf7d0;margin-bottom:8px;">'
+        f'<span style="font-size:18px;">📄</span>'
+        f'<span style="font-weight:700;font-size:14px;color:#166534;">Full Content</span>'
+        f'<span style="margin-left:auto;font-size:12px;color:#6b7280;">'
+        f'{line_count} lines · {char_count:,} characters</span>'
+        f'</div>'
     )
 
-    return cost_html, input_quality_html, output_quality_html, comparison_html
+    return (
+        gr.update(value=text.strip(), visible=True),
+        preview_html,
+        gr.update(visible=True),
+        "Select all text above to copy, or edit and click **Save & Download**.",
+    )
+
+
+def save_skill_to_file(content: str) -> tuple[Any, str]:
+    """Write the content box text to a downloadable file.
+
+    Returns:
+        (file_update, status_msg)
+    """
+    if not content or not content.strip():
+        return gr.update(visible=False), "⚠ Nothing to save — content is empty."
+
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".md", prefix="skill_agent_",
+        delete=False, encoding="utf-8",
+    )
+    tmp.write(content.strip())
+    tmp.close()
+
+    return gr.update(value=tmp.name, visible=True), "✓ File saved — click the link above to download."
 
 
 # ---------------------------------------------------------------------------
@@ -291,19 +368,150 @@ def analyze_prompt(
 
 def evaluate_new_prompt(
     title: str, text: str, category: str, provider: str, model: str,
-) -> str:
-    if not text.strip():
-        return "<p style='color:#dc2626;font-weight:600;'>Please enter a prompt to evaluate.</p>"
+) -> tuple[str, str]:
+    """Run full evaluation on a user-written prompt.
 
-    start = time.time()
+    Performs the same pipeline as the Analyze tab:
+      1. Token count + pricing (cost card)
+      2. Input evaluation  — 5 prompt quality metrics
+      3. Generate LLM response
+      4. Output evaluation — 6 response quality metrics
+
+    Returns:
+        (cost_html, combined_results_html)
+    """
+    if not text.strip():
+        err = "<p style='color:#dc2626;font-weight:600;'>Please enter a prompt to evaluate.</p>"
+        return err, ""
+
+    prompt = text.strip()
+
+    # Token cost card
+    cost_info = _pricing_for_model(prompt, model)
+    cost_html = build_cost_card_html(
+        model=model,
+        provider=provider,
+        tokens=cost_info["tokens"],
+        input_cost=cost_info["input_cost"],
+        output_cost=cost_info["output_cost"],
+    )
+
+    # Full evaluation (input + LLM response + output)
+    eval_result = run_full_evaluation(prompt, provider, model)
+
+    for e in eval_result["errors"]:
+        cost_html += f"<pre style='color:#dc2626;font-size:12px;'>{e}</pre>"
+
+    combined_html = build_combined_results_html(
+        input_scores=eval_result["input_scores"],
+        output_scores=eval_result["output_scores"],
+        provider=provider,
+        input_elapsed=eval_result["input_elapsed"],
+        output_elapsed=eval_result["output_elapsed"],
+        model=model,
+        response_preview=eval_result["response_text"],
+    )
+
+    return cost_html, combined_html
+
+
+def _available_providers() -> set[str]:
+    """Return the set of providers whose API key is configured."""
+    providers: set[str] = set()
+    if os.environ.get("OPENAI_API_KEY", "").strip():
+        providers.add("OpenAI")
+    if os.environ.get("ANTHROPIC_API_KEY", "").strip():
+        providers.add("Anthropic")
+    if os.environ.get("GOOGLE_API_KEY", "").strip():
+        providers.add("Google")
+    return providers
+
+
+def _all_models_pricing(text: str) -> list[dict[str, Any]]:
+    """Compute token count + cost for every model in ALL_MODELS.
+
+    Marks each row as available/unavailable based on whether the
+    provider's API key is configured.
+    """
+    available = _available_providers()
+    rows: list[dict[str, Any]] = []
+    for m in ALL_MODELS:
+        prov = PROVIDER_FOR_MODEL[m]
+        p = _pricing_for_model(text, m)
+        total = p["input_cost"] + p["output_cost"]
+        rows.append({
+            "model": m,
+            "provider": prov,
+            "tokens": p["tokens"],
+            "input_cost": p["input_cost"],
+            "output_cost": p["output_cost"],
+            "total_cost": total,
+            "available": prov in available,
+        })
+    return rows
+
+
+def refine_new_prompt(
+    title: str, text: str, category: str, provider: str, model: str,
+) -> tuple[str, str, str]:
+    """Refine + compress the prompt, then show all-models pricing.
+
+    Pipeline:
+      1. Compress — generate a cheaper, token-efficient version
+      2. Refine  — improve quality of the compressed version
+      3. Table   — show token/cost comparison across ALL models
+
+    Returns:
+        (saving_html, refine_html, pricing_table_html)
+    """
+    if not text.strip():
+        err = "<p style='color:#dc2626;font-weight:600;'>Please enter a prompt to refine.</p>"
+        return err, "", ""
+
+    prompt = text.strip()
+    saving_html = ""
+    refine_html = ""
+    table_html = ""
+
+    # Step 1: Compress for cheapest tokens
+    compressed_text = prompt
+    reason = ""
     try:
-        scores = run_evaluation(text.strip(), provider, model)
+        compressed_text, reason = generate_cheaper_alternative(
+            prompt, provider, model,
+        )
+    except Exception as exc:
+        reason = f"Compression unavailable: {exc}"
+
+    orig_pricing = _pricing_for_model(prompt, model)
+    comp_pricing = _pricing_for_model(compressed_text, model)
+    orig_total = orig_pricing["input_cost"] + orig_pricing["output_cost"]
+    comp_total = comp_pricing["input_cost"] + comp_pricing["output_cost"]
+
+    saving_html = build_token_saving_suggestion_html(
+        original_tokens=orig_pricing["tokens"],
+        original_cost=orig_total,
+        compressed_tokens=comp_pricing["tokens"],
+        compressed_cost=comp_total,
+        compressed_text=compressed_text,
+        reason=reason,
+    )
+
+    # Step 2: Refine the compressed prompt for quality
+    try:
+        raw = refine_prompt(compressed_text, provider, model)
+        refine_html = build_refinement_html(raw, model=model, provider=provider)
     except Exception as exc:
         tb = traceback.format_exc()
-        return f"<pre style='color:#dc2626;'>Evaluation failed:\n{exc}\n\n{tb}</pre>"
+        refine_html = (
+            f"<pre style='color:#dc2626;'>Refinement failed:\n{exc}\n\n{tb}</pre>"
+        )
 
-    elapsed = time.time() - start
-    return build_results_html(scores, provider, elapsed, model)
+    # Step 3: All-models pricing table for the refined/compressed prompt
+    model_rows = _all_models_pricing(compressed_text)
+    table_html = build_all_models_pricing_html(model_rows, model)
+
+    return saving_html, refine_html, table_html
 
 
 def save_prompt_as_txt(title: str, text: str) -> tuple[str | None, str]:
@@ -338,27 +546,16 @@ def _update_model_choices(provider: str):
 _ANALYZER_CHOICES = [MODEL_DISPLAY_NAMES[m] for m in ALL_MODELS]
 _DISPLAY_TO_MODEL = {v: k for k, v in MODEL_DISPLAY_NAMES.items()}
 
-# Highlighted section header HTML
-_INPUT_HEADER = (
+_EVAL_HEADER = (
     '<div style="display:flex;align-items:center;gap:12px;padding:14px 20px;'
     'border-radius:12px;background:linear-gradient(135deg,#ede9fe,#dbeafe);'
     'border:1px solid #c4b5fd;margin-bottom:16px;">'
-    '<span style="font-size:22px;">📥</span>'
+    '<span style="font-size:22px;">📊</span>'
     '<div>'
-    '<div style="font-size:15px;font-weight:800;color:#4c1d95;">Input Evaluator</div>'
+    '<div style="font-size:15px;font-weight:800;color:#4c1d95;">Evaluation Results</div>'
     '<div style="font-size:12px;color:#6b7280;margin-top:2px;">'
-    'Scores the <strong>prompt itself</strong> — Clarity · Specificity · Completeness · Coherence · Safety'
-    '</div></div></div>'
-)
-_OUTPUT_HEADER = (
-    '<div style="display:flex;align-items:center;gap:12px;padding:14px 20px;'
-    'border-radius:12px;background:linear-gradient(135deg,#ccfbf1,#cffafe);'
-    'border:1px solid #67e8f9;margin-bottom:16px;">'
-    '<span style="font-size:22px;">📤</span>'
-    '<div>'
-    '<div style="font-size:15px;font-weight:800;color:#164e63;">Output Evaluator</div>'
-    '<div style="font-size:12px;color:#6b7280;margin-top:2px;">'
-    'Scores the <strong>LLM\'s response</strong> — Answer Relevancy · Hallucination · Bias · Toxicity · Conciseness · Context Precision'
+    '<strong>Input</strong> (Clarity · Specificity · Completeness · Coherence · Safety) + '
+    '<strong>Output</strong> (Relevancy · Hallucination · Bias · Toxicity · Conciseness · Precision)'
     '</div></div></div>'
 )
 
@@ -379,7 +576,6 @@ def build_app() -> gr.Blocks:
 
         gr.HTML(HEADER_HTML)
 
-        # ── Metric definitions (two accordions: input + output) ───────────
         with gr.Accordion("📥 Input Metrics — what do they mean?  (click to expand)", open=False):
             gr.HTML(build_metric_cards_html())
 
@@ -393,9 +589,9 @@ def build_app() -> gr.Blocks:
             # ═══════════════════════════════════════════════════════════════
             with gr.Tab("Analyze Prompt File", id="tab-analyze"):
                 gr.Markdown(
-                    "Upload a file or paste content, pick a model, and click **Analyze**. "
-                    "You'll get token cost, prompt quality scores **(Input Evaluator)**, "
-                    "response quality scores **(Output Evaluator)**, and a cheaper alternative."
+                    "Upload a **Skill**, **Agent**, or **Subagent** file (or paste content), "
+                    "pick a model, and click **Analyze** for token cost + quality scores. "
+                    "Then click **Refine** for an optimized version with token savings."
                 )
 
                 with gr.Tabs():
@@ -412,6 +608,22 @@ def build_app() -> gr.Blocks:
                             lines=10,
                         )
 
+                # Additional context field
+                analyze_context = gr.Textbox(
+                    label="Additional Context (optional)",
+                    placeholder=(
+                        "Provide extra context to improve refinement accuracy. "
+                        "e.g. JIRA ticket URL, requirements, domain info:\n"
+                        "https://company.atlassian.net/browse/PROJ-123\n"
+                        "This agent should handle login flows for the Pantheon app…"
+                    ),
+                    lines=3,
+                    info=(
+                        "Used during Refine — helps the AI understand the real-world "
+                        "use case for this skill/agent."
+                    ),
+                )
+
                 with gr.Row():
                     model_selector = gr.Dropdown(
                         choices=_ANALYZER_CHOICES,
@@ -425,16 +637,39 @@ def build_app() -> gr.Blocks:
                 # Cost card
                 analyze_cost_html = gr.HTML(value="", elem_id="analyze-cost-panel")
 
-                # Input evaluator section
-                gr.HTML(_INPUT_HEADER)
-                analyze_input_html = gr.HTML(value="", elem_id="analyze-input-panel")
+                # Combined evaluation results (input + output)
+                gr.HTML(_EVAL_HEADER)
+                analyze_results_html = gr.HTML(value="", elem_id="analyze-results-panel")
 
-                # Output evaluator section
-                gr.HTML(_OUTPUT_HEADER)
-                analyze_output_html = gr.HTML(value="", elem_id="analyze-output-panel")
+                # Action buttons
+                with gr.Row():
+                    analyze_view_btn = gr.Button(
+                        "📄 View & Save Skill / Agent", variant="secondary",
+                    )
+                    analyze_refine_btn = gr.Button(
+                        "✨ Refine Skill / Agent", variant="primary",
+                    )
 
-                # Comparison panel
-                analyze_comparison_html = gr.HTML(value="", elem_id="analyze-comparison-panel")
+                # View & Save section
+                analyze_preview_html = gr.HTML(value="", elem_id="analyze-preview-header")
+                analyze_content_box = gr.Textbox(
+                    label="Skill / Agent Content (select all → copy, or edit before saving)",
+                    lines=15,
+                    max_lines=40,
+                    visible=False,
+                    interactive=True,
+                )
+                with gr.Row():
+                    analyze_save_download_btn = gr.Button(
+                        "💾 Save & Download as File", variant="secondary", visible=False,
+                    )
+                analyze_status = gr.Markdown("")
+                analyze_download = gr.File(
+                    label="Downloaded file", visible=False, interactive=False,
+                )
+
+                # Refine output
+                analyze_refine_html = gr.HTML(value="", elem_id="analyze-refine-panel")
 
             # ═══════════════════════════════════════════════════════════════
             # TAB 2: Write New Prompt
@@ -442,9 +677,12 @@ def build_app() -> gr.Blocks:
             with gr.Tab("Write New Prompt", id="tab-new-prompt"):
                 gr.Markdown(
                     "Describe your goal — the **PROMPT** or **CROFT** framework is "
-                    "auto-detected. Click **Build Structured Prompt**, then evaluate it."
+                    "auto-detected. Click **Build Structured Prompt**, then **Evaluate** "
+                    "to get token cost + **Input** and **Output** quality scores. "
+                    "**Refine** or **Save** when ready."
                 )
 
+                # ── Prompt builder section ─────────────────────────────
                 with gr.Group(elem_classes=["prompt-builder-section"]):
                     gr.HTML(
                         '<div class="section-title">'
@@ -477,6 +715,7 @@ def build_app() -> gr.Blocks:
                             "✨ Build Structured Prompt", variant="primary", scale=0,
                         )
 
+                # ── Prompt editor + controls ───────────────────────────
                 with gr.Row():
                     with gr.Column(scale=1):
                         new_title = gr.Textbox(
@@ -487,9 +726,11 @@ def build_app() -> gr.Blocks:
                             placeholder="Your structured prompt appears here…",
                             lines=12,
                         )
+                    with gr.Column(scale=1):
                         with gr.Row():
                             new_category = gr.Dropdown(
-                                choices=PROMPT_CATEGORIES, value="cursor prompt", label="Category",
+                                choices=PROMPT_CATEGORIES, value="cursor prompt",
+                                label="Category",
                             )
                             new_provider = gr.Radio(
                                 choices=["OpenAI", "Anthropic", "Google"],
@@ -499,18 +740,38 @@ def build_app() -> gr.Blocks:
                             choices=OPENAI_MODELS, value=OPENAI_MODELS[0], label="Model",
                         )
                         with gr.Row():
-                            new_evaluate_btn = gr.Button("Evaluate Prompt", variant="primary")
-                            new_save_btn = gr.Button("💾 Save as .txt", variant="secondary")
+                            new_evaluate_btn = gr.Button(
+                                "Evaluate Prompt", variant="primary",
+                            )
+                            new_refine_btn = gr.Button(
+                                "✨ Refine Prompt", variant="secondary",
+                            )
+                            new_save_btn = gr.Button(
+                                "💾 Save as .txt", variant="secondary",
+                            )
                         new_status = gr.Markdown("")
                         new_download = gr.File(
-                            label="Download your prompt", visible=False, interactive=False,
+                            label="Download your prompt", visible=False,
+                            interactive=False,
                         )
 
-                    with gr.Column(scale=1):
-                        gr.HTML(_INPUT_HEADER)
-                        new_results_html = gr.HTML(
-                            value=EMPTY_RESULTS_HTML, elem_id="new-results-panel",
-                        )
+                # ── Results (full width below editor) ─────────────────
+                new_cost_html = gr.HTML(value="", elem_id="new-cost-panel")
+
+                gr.HTML(_EVAL_HEADER)
+                new_results_html = gr.HTML(
+                    value=EMPTY_RESULTS_HTML, elem_id="new-results-panel",
+                )
+
+                new_saving_html = gr.HTML(
+                    value="", elem_id="new-saving-panel",
+                )
+                new_refine_html = gr.HTML(
+                    value="", elem_id="new-refine-panel",
+                )
+                new_pricing_table_html = gr.HTML(
+                    value="", elem_id="new-pricing-table-panel",
+                )
 
             # ═══════════════════════════════════════════════════════════════
             # TAB 3: Settings
@@ -546,7 +807,7 @@ def build_app() -> gr.Blocks:
             outputs=[keys_status],
         )
 
-        # Analyze tab
+        # Analyze tab — main analysis
         def _run_analyze(uploaded_file, pasted_text, display_name):
             model = (
                 _DISPLAY_TO_MODEL.get(display_name)
@@ -559,11 +820,44 @@ def build_app() -> gr.Blocks:
             inputs=[file_upload, paste_input, model_selector],
             outputs=[
                 analyze_cost_html,
-                analyze_input_html,
-                analyze_output_html,
-                analyze_comparison_html,
+                analyze_results_html,
             ],
             api_name="analyze_prompt_api",
+        )
+
+        # Analyze tab — view content
+        analyze_view_btn.click(
+            fn=view_skill_content,
+            inputs=[file_upload, paste_input],
+            outputs=[
+                analyze_content_box,
+                analyze_preview_html,
+                analyze_save_download_btn,
+                analyze_status,
+            ],
+        )
+
+        # Analyze tab — save & download (from the content box)
+        analyze_save_download_btn.click(
+            fn=save_skill_to_file,
+            inputs=[analyze_content_box],
+            outputs=[analyze_download, analyze_status],
+        )
+
+        # Analyze tab — refine (with context)
+        def _refine_analyzed(uploaded_file, pasted_text, display_name, context):
+            model = (
+                _DISPLAY_TO_MODEL.get(display_name)
+                or (display_name if display_name in ALL_MODELS else ALL_MODELS[0])
+            )
+            return refine_analyzed_prompt(
+                uploaded_file, pasted_text, model, context=context,
+            )
+
+        analyze_refine_btn.click(
+            fn=_refine_analyzed,
+            inputs=[file_upload, paste_input, model_selector, analyze_context],
+            outputs=[analyze_refine_html],
         )
 
         # Write New Prompt: framework detection
@@ -578,7 +872,7 @@ def build_app() -> gr.Blocks:
         )
 
         new_build_btn.click(
-            fn=lambda idea, fw: build_prompt(idea, fw),  # type: ignore[arg-type]
+            fn=lambda idea, fw: build_prompt(idea, fw),
             inputs=[new_idea, new_framework_radio],
             outputs=[new_text],
         )
@@ -592,7 +886,14 @@ def build_app() -> gr.Blocks:
         new_evaluate_btn.click(
             fn=evaluate_new_prompt,
             inputs=[new_title, new_text, new_category, new_provider, new_model],
-            outputs=[new_results_html],
+            outputs=[new_cost_html, new_results_html],
+        )
+
+        # Write New Prompt — refine + token saving + all-models pricing
+        new_refine_btn.click(
+            fn=refine_new_prompt,
+            inputs=[new_title, new_text, new_category, new_provider, new_model],
+            outputs=[new_saving_html, new_refine_html, new_pricing_table_html],
         )
 
         # Save as .txt
@@ -619,9 +920,10 @@ def build_app() -> gr.Blocks:
 
 def main():
     app = build_app()
+    port = int(os.environ.get("PORT", os.environ.get("GRADIO_SERVER_PORT", "7860")))
     app.launch(
-        server_name="127.0.0.1",
-        server_port=7860,
+        server_name="0.0.0.0",
+        server_port=port,
         theme=app._theme,
         css=app._css,
         ssr_mode=False,

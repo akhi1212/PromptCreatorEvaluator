@@ -2,10 +2,11 @@
 evaluator.py — Prompt evaluation and refinement engine.
 
 Contains:
-  - Metric definitions (what we score and how)
+  - Metric definitions (input + output quality)
   - Available model choices per provider
-  - run_evaluation()  — scores a prompt via DeepEval G-Eval
-  - refine_prompt()   — calls the LLM to produce an improved version
+  - run_evaluation()       — scores prompt (input metrics) + LLM response (output metrics)
+  - refine_prompt()        — calls the LLM to produce an improved version
+  - generate_prompt_response() — gets an actual LLM response for output evaluation
 
 All DeepEval / OpenAI / Anthropic imports are deferred so the rest
 of the app can load without requiring an API key.
@@ -16,7 +17,6 @@ from __future__ import annotations
 import os
 from typing import Any
 
-# Model lists and pricing are defined in config/pricing.py (single source of truth).
 from config.pricing import (
     ANTHROPIC_MODELS,
     GOOGLE_MODELS,
@@ -25,9 +25,8 @@ from config.pricing import (
 )
 
 # ---------------------------------------------------------------------------
-# Metric definitions
+# INPUT metric definitions  (what we score on the *prompt itself*)
 # ---------------------------------------------------------------------------
-# Each dict drives both DeepEval evaluation and the UI display.
 
 METRIC_DEFS: list[dict[str, Any]] = [
     {
@@ -133,428 +132,7 @@ METRIC_DEFS: list[dict[str, Any]] = [
 ]
 
 # ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-REFINEMENT_SYSTEM_PROMPT = """\
-You are an expert prompt engineer. The user will give you a prompt they wrote \
-for an LLM. Your job is to:
-
-1. List 3-5 specific issues with the original prompt (bullet points).
-2. Provide a refined, improved version of the prompt that fixes those issues.
-
-Focus on: clarity, specificity, completeness, coherence, and safety.
-Keep the user's original intent intact — do NOT change what they are asking for, \
-only improve HOW they ask it.
-
-Respond in this exact format (use the headings as shown):
-
-### Issues Found
-- issue 1
-- issue 2
-...
-
-### Refined Prompt
-<the improved prompt here>
-
-### What Changed
-- change 1
-- change 2
-...
-"""
-
-
-def _resolve_model(provider: str, model: str) -> str:
-    """Return a valid model string, falling back to the first available model.
-
-    Args:
-        provider: "OpenAI", "Anthropic", or "Google".
-        model:    User-selected model string (may be empty).
-
-    Returns:
-        A guaranteed-valid model identifier.
-    """
-    if provider == "OpenAI":
-        return model if model in OPENAI_MODELS else OPENAI_MODELS[0]
-    if provider == "Google":
-        return model if model in GOOGLE_MODELS else GOOGLE_MODELS[0]
-    return model if model in ANTHROPIC_MODELS else ANTHROPIC_MODELS[0]
-
-
-def _check_api_key(provider: str) -> None:
-    """Raise ValueError if the required API key is missing.
-
-    Args:
-        provider: "OpenAI", "Anthropic", or "Google".
-    """
-    if provider == "OpenAI" and not os.environ.get("OPENAI_API_KEY"):
-        raise ValueError("OpenAI API key not set. Please save it in the Settings tab.")
-    if provider == "Anthropic" and not os.environ.get("ANTHROPIC_API_KEY"):
-        raise ValueError("Anthropic API key not set. Please save it in the Settings tab.")
-    if provider == "Google" and not os.environ.get("GOOGLE_API_KEY"):
-        raise ValueError("Google API key not set. Please save it in the Settings tab.")
-
-
-# ---------------------------------------------------------------------------
-# Evaluation
-# ---------------------------------------------------------------------------
-
-
-def _make_eval_model(provider: str, model_str: str):
-    """Create the appropriate DeepEval model object for the given provider.
-
-    Args:
-        provider:   "OpenAI", "Anthropic", or "Google".
-        model_str:  Model identifier (e.g. "gpt-4o-mini", "claude-3-5-haiku-20241022").
-
-    Returns:
-        A model string (OpenAI) or DeepEval model object (Anthropic/Google).
-    """
-    if provider == "Anthropic":
-        from deepeval.models import AnthropicModel
-        return AnthropicModel(model=model_str)
-    if provider == "Google":
-        from deepeval.models import GeminiModel
-        return GeminiModel(model=model_str)
-    # OpenAI — DeepEval uses string directly
-    return model_str
-
-
-def _build_metrics(provider: str, model_str: str):
-    """Create one GEval instance per metric definition.
-
-    Args:
-        provider:  "OpenAI", "Anthropic", or "Google".
-        model_str: Model identifier.
-
-    Returns:
-        List of configured GEval metric objects.
-    """
-    from deepeval.metrics import GEval
-    from deepeval.test_case import LLMTestCaseParams
-
-    eval_model = _make_eval_model(provider, model_str)
-
-    metrics = []
-    for mdef in METRIC_DEFS:
-        metrics.append(
-            GEval(
-                name=mdef["name"],
-                criteria=mdef["criteria"],
-                evaluation_steps=mdef["steps"],
-                evaluation_params=[
-                    LLMTestCaseParams.INPUT,
-                    LLMTestCaseParams.ACTUAL_OUTPUT,
-                ],
-                model=eval_model,
-                threshold=0.5,
-                async_mode=False,
-            )
-        )
-    return metrics
-
-
-def run_evaluation(
-    prompt_text: str, provider: str, model: str = ""
-) -> dict[str, dict[str, Any]]:
-    """Score a prompt across all metrics using the chosen provider and model.
-
-    Args:
-        prompt_text: The raw prompt string to evaluate.
-        provider:    "OpenAI", "Anthropic", or "Google".
-        model:       Specific model to use (falls back to default if empty).
-
-    Returns:
-        Dict mapping metric name -> {"score": float, "reason": str, "passed": bool}.
-
-    Raises:
-        ValueError: If the required API key is not set.
-    """
-    from deepeval.test_case import LLMTestCase
-
-    _check_api_key(provider)
-    model_str = _resolve_model(provider, model)
-
-    test_case = LLMTestCase(input=prompt_text, actual_output=prompt_text)
-    metrics = _build_metrics(provider, model_str)
-
-    results: dict[str, dict[str, Any]] = {}
-    for metric in metrics:
-        try:
-            metric.measure(test_case)
-            results[metric.name] = {
-                "score": round(metric.score, 4),
-                "reason": metric.reason or "",
-                "passed": metric.score >= metric.threshold,
-            }
-        except Exception as exc:
-            results[metric.name] = {
-                "score": 0.0,
-                "reason": f"Error: {exc}",
-                "passed": False,
-            }
-
-    return results
-
-
-# ---------------------------------------------------------------------------
-# Prompt refinement
-# ---------------------------------------------------------------------------
-
-
-def refine_prompt(prompt_text: str, provider: str, model: str = "") -> str:
-    """Call the LLM to produce an improved version of the user's prompt.
-
-    Args:
-        prompt_text: The original prompt to improve.
-        provider:    "OpenAI", "Anthropic", or "Google".
-        model:       Specific model to use (falls back to default if empty).
-
-    Returns:
-        The LLM's response containing issues, refined prompt, and changes.
-
-    Raises:
-        ValueError: If the required API key is not set.
-    """
-    _check_api_key(provider)
-    model_str = _resolve_model(provider, model)
-
-    if provider == "OpenAI":
-        return _refine_openai(prompt_text, model_str)
-    if provider == "Google":
-        return _refine_google(prompt_text, model_str)
-    return _refine_anthropic(prompt_text, model_str)
-
-
-def _refine_openai(prompt_text: str, model_str: str) -> str:
-    """Call OpenAI chat completions to refine a prompt.
-
-    Args:
-        prompt_text: The original prompt.
-        model_str:   OpenAI model identifier.
-
-    Returns:
-        The assistant's response text.
-    """
-    from openai import OpenAI
-
-    client = OpenAI()
-    response = client.chat.completions.create(
-        model=model_str,
-        messages=[
-            {"role": "system", "content": REFINEMENT_SYSTEM_PROMPT},
-            {"role": "user", "content": prompt_text},
-        ],
-        temperature=0.4,
-        max_tokens=2048,
-    )
-    return response.choices[0].message.content or ""
-
-
-def _refine_anthropic(prompt_text: str, model_str: str) -> str:
-    """Call Anthropic messages API to refine a prompt.
-
-    Args:
-        prompt_text: The original prompt.
-        model_str:   Anthropic model identifier.
-
-    Returns:
-        The assistant's response text.
-    """
-    from anthropic import Anthropic
-
-    client = Anthropic()
-    response = client.messages.create(
-        model=model_str,
-        system=REFINEMENT_SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": prompt_text}],
-        temperature=0.4,
-        max_tokens=2048,
-    )
-    return response.content[0].text
-
-
-def _refine_google(prompt_text: str, model_str: str) -> str:
-    """Call Google Gemini to refine a prompt.
-
-    Args:
-        prompt_text: The original prompt.
-        model_str:   Gemini model identifier.
-
-    Returns:
-        The model's response text.
-    """
-    from google import genai
-
-    client = genai.Client(api_key=os.environ.get("GOOGLE_API_KEY"))
-    response = client.models.generate_content(
-        model=model_str,
-        contents=f"{REFINEMENT_SYSTEM_PROMPT}\n\n{prompt_text}",
-        config={
-            "temperature": 0.4,
-            "max_output_tokens": 2048,
-        },
-    )
-    return response.text or ""
-
-
-# ---------------------------------------------------------------------------
-# Token pricing
-# ---------------------------------------------------------------------------
-# MODEL_PRICING is imported from config.pricing at the top of this file.
-
-
-def _count_tokens_openai(text: str, model: str) -> int:
-    """Count tokens using tiktoken (offline, no API call).
-
-    Args:
-        text:  The prompt string to tokenize.
-        model: OpenAI model identifier.
-
-    Returns:
-        Approximate token count.
-    """
-    import tiktoken
-
-    try:
-        enc = tiktoken.encoding_for_model(model)
-    except KeyError:
-        enc = tiktoken.get_encoding("o200k_base")
-    return len(enc.encode(text))
-
-
-def _count_tokens_anthropic(text: str, model: str) -> int:
-    """Count tokens via the free Anthropic count_tokens endpoint.
-
-    Args:
-        text:  The prompt string.
-        model: Anthropic model identifier.
-
-    Returns:
-        Token count from the API.
-    """
-    from anthropic import Anthropic
-
-    client = Anthropic()
-    resp = client.messages.count_tokens(
-        model=model,
-        messages=[{"role": "user", "content": text}],
-    )
-    return resp.input_tokens
-
-
-def _count_tokens_google(text: str, model: str) -> int:
-    """Count tokens via Google genai count_tokens.
-
-    Args:
-        text:  The prompt string.
-        model: Gemini model identifier.
-
-    Returns:
-        Token count from the API.
-    """
-    from google import genai
-
-    client = genai.Client(api_key=os.environ.get("GOOGLE_API_KEY"))
-    resp = client.models.count_tokens(model=model, contents=text)
-    return resp.total_tokens
-
-
-def calculate_token_pricing(
-    prompt_text: str,
-) -> list[dict[str, Any]]:
-    """Calculate token counts and costs for ALL models across all providers.
-
-    Token counting is always available for all models:
-      - OpenAI: uses tiktoken (offline, free).
-      - Anthropic / Google: uses their native count_tokens API when the key
-        is configured; falls back to tiktoken approximation otherwise.
-
-    Args:
-        prompt_text: The prompt to analyse.
-
-    Returns:
-        List of dicts, each with keys:
-            provider, model, tokens, input_cost, output_cost, source
-    """
-    results: list[dict[str, Any]] = []
-
-    has_anthropic = bool(os.environ.get("ANTHROPIC_API_KEY"))
-    has_google = bool(os.environ.get("GOOGLE_API_KEY"))
-
-    # Shared tiktoken fallback for approximate counts.
-    def _tiktoken_approx(text: str) -> int:
-        import tiktoken
-        enc = tiktoken.get_encoding("o200k_base")
-        return len(enc.encode(text))
-
-    # --- OpenAI models (always exact via tiktoken) ---
-    for model in OPENAI_MODELS:
-        try:
-            tokens = _count_tokens_openai(prompt_text, model)
-            pricing = MODEL_PRICING[model]
-            results.append({
-                "provider": "OpenAI",
-                "model": model,
-                "tokens": tokens,
-                "input_cost": round(tokens * pricing["input"] / 1_000_000, 6),
-                "output_cost": round(tokens * pricing["output"] / 1_000_000, 6),
-            })
-        except Exception as exc:
-            results.append({
-                "provider": "OpenAI", "model": model, "tokens": 0,
-                "input_cost": 0.0, "output_cost": 0.0, "error": str(exc),
-            })
-
-    # --- Anthropic models ---
-    for model in ANTHROPIC_MODELS:
-        try:
-            if has_anthropic:
-                tokens = _count_tokens_anthropic(prompt_text, model)
-            else:
-                tokens = _tiktoken_approx(prompt_text)
-            pricing = MODEL_PRICING[model]
-            results.append({
-                "provider": "Anthropic",
-                "model": model,
-                "tokens": tokens,
-                "input_cost": round(tokens * pricing["input"] / 1_000_000, 6),
-                "output_cost": round(tokens * pricing["output"] / 1_000_000, 6),
-                **({"source": "approx"} if not has_anthropic else {}),
-            })
-        except Exception as exc:
-            results.append({
-                "provider": "Anthropic", "model": model, "tokens": 0,
-                "input_cost": 0.0, "output_cost": 0.0, "error": str(exc),
-            })
-
-    # --- Google models ---
-    for model in GOOGLE_MODELS:
-        try:
-            if has_google:
-                tokens = _count_tokens_google(prompt_text, model)
-            else:
-                tokens = _tiktoken_approx(prompt_text)
-            pricing = MODEL_PRICING[model]
-            results.append({
-                "provider": "Google",
-                "model": model,
-                "tokens": tokens,
-                "input_cost": round(tokens * pricing["input"] / 1_000_000, 6),
-                "output_cost": round(tokens * pricing["output"] / 1_000_000, 6),
-                **({"source": "approx"} if not has_google else {}),
-            })
-        except Exception as exc:
-            results.append({
-                "provider": "Google", "model": model, "tokens": 0,
-                "input_cost": 0.0, "output_cost": 0.0, "error": str(exc),
-            })
-
-    return results
-
-
-# ---------------------------------------------------------------------------
-# Output metric definitions  (what we score on the LLM *response*)
+# OUTPUT metric definitions  (what we score on the LLM *response*)
 # ---------------------------------------------------------------------------
 
 OUTPUT_METRIC_DEFS: list[dict[str, Any]] = [
@@ -679,6 +257,325 @@ OUTPUT_METRIC_DEFS: list[dict[str, Any]] = [
     },
 ]
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+REFINEMENT_SYSTEM_PROMPT = """\
+You are an expert prompt engineer. The user will give you a prompt they wrote \
+for an LLM. Your job is to:
+
+1. List 3-5 specific issues with the original prompt (bullet points).
+2. Provide a refined, improved version of the prompt that fixes those issues.
+
+Focus on: clarity, specificity, completeness, coherence, and safety.
+Keep the user's original intent intact — do NOT change what they are asking for, \
+only improve HOW they ask it.
+
+Respond in this exact format (use the headings as shown):
+
+### Issues Found
+- issue 1
+- issue 2
+...
+
+### Refined Prompt
+<the improved prompt here>
+
+### What Changed
+- change 1
+- change 2
+...
+"""
+
+SKILL_REFINEMENT_SYSTEM_PROMPT = """\
+You are an expert AI Agent / Cursor Skill architect. The user will give you the \
+full content of a **Skill file** (SKILL.md), **Agent definition**, or **subagent \
+configuration** — NOT a simple prompt. Your job is to review and improve this \
+Skill or Agent definition so it performs better when used by an AI coding assistant.
+
+Analyse the content as a Skill / Agent / Subagent definition and:
+
+1. List 3-5 specific issues with the current definition (bullet points). \
+Focus on:
+   - **Trigger clarity** — are the activation conditions clear and unambiguous?
+   - **Instruction completeness** — does it cover edge cases, error handling, fallbacks?
+   - **Structure & organisation** — are sections well-ordered (description, steps, rules, examples)?
+   - **Token efficiency** — is the skill bloated with unnecessary text that wastes context window?
+   - **Specificity** — are instructions concrete enough for an AI agent to follow without guessing?
+   - **Safety & guardrails** — does it prevent harmful or unintended actions?
+   - **Output format** — does it specify what the agent should produce and in what format?
+
+2. Provide a refined, improved version of the Skill / Agent definition that \
+fixes those issues. Preserve the original file format (markdown, YAML frontmatter, \
+code blocks, etc.). Keep the original purpose and workflow intact — only improve \
+HOW the instructions are written and structured.
+
+3. List what you changed and why.
+
+Respond in this exact format (use the headings as shown):
+
+### Issues Found
+- issue 1
+- issue 2
+...
+
+### Refined Skill
+<the improved skill / agent definition here — preserve original format>
+
+### What Changed
+- change 1
+- change 2
+...
+"""
+
+
+def _resolve_model(provider: str, model: str) -> str:
+    """Return a valid model string, falling back to the first available model."""
+    if provider == "OpenAI":
+        return model if model in OPENAI_MODELS else OPENAI_MODELS[0]
+    if provider == "Google":
+        return model if model in GOOGLE_MODELS else GOOGLE_MODELS[0]
+    return model if model in ANTHROPIC_MODELS else ANTHROPIC_MODELS[0]
+
+
+def _check_api_key(provider: str) -> None:
+    """Raise ValueError if the required API key is missing."""
+    if provider == "OpenAI" and not os.environ.get("OPENAI_API_KEY"):
+        raise ValueError("OpenAI API key not set. Please save it in the Settings tab.")
+    if provider == "Anthropic" and not os.environ.get("ANTHROPIC_API_KEY"):
+        raise ValueError("Anthropic API key not set. Please save it in the Settings tab.")
+    if provider == "Google" and not os.environ.get("GOOGLE_API_KEY"):
+        raise ValueError("Google API key not set. Please save it in the Settings tab.")
+
+
+def _metric_name(metric) -> str:
+    """Safely extract the display name from any DeepEval metric object.
+
+    GEval exposes `.name`; built-in metrics (AnswerRelevancyMetric, etc.)
+    use `.__name__` instead.
+    """
+    return getattr(metric, "name", None) or metric.__name__
+
+
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
+
+
+def _make_eval_model(provider: str, model_str: str):
+    """Create the appropriate DeepEval model object for the given provider."""
+    if provider == "Anthropic":
+        from deepeval.models import AnthropicModel
+        return AnthropicModel(model=model_str)
+    if provider == "Google":
+        from deepeval.models import GeminiModel
+        return GeminiModel(model=model_str)
+    return model_str
+
+
+def _build_input_metrics(provider: str, model_str: str):
+    """Create one GEval instance per INPUT metric definition."""
+    from deepeval.metrics import GEval
+    from deepeval.test_case import LLMTestCaseParams
+
+    eval_model = _make_eval_model(provider, model_str)
+
+    metrics = []
+    for mdef in METRIC_DEFS:
+        metrics.append(
+            GEval(
+                name=mdef["name"],
+                criteria=mdef["criteria"],
+                evaluation_steps=mdef["steps"],
+                evaluation_params=[
+                    LLMTestCaseParams.INPUT,
+                    LLMTestCaseParams.ACTUAL_OUTPUT,
+                ],
+                model=eval_model,
+                threshold=0.5,
+                async_mode=False,
+            )
+        )
+    return metrics
+
+
+def _build_output_metrics(provider: str, model_str: str):
+    """Create metric instances for OUTPUT evaluation.
+
+    Uses DeepEval built-in metrics where available (Answer Relevancy,
+    Hallucination, Bias, Toxicity) and GEval for custom ones
+    (Conciseness, Context Precision).
+    """
+    from deepeval.metrics import (
+        AnswerRelevancyMetric,
+        BiasMetric,
+        GEval,
+        HallucinationMetric,
+        ToxicityMetric,
+    )
+    from deepeval.test_case import LLMTestCaseParams
+
+    eval_model = _make_eval_model(provider, model_str)
+
+    _conciseness = GEval(
+        name="Conciseness",
+        criteria=OUTPUT_METRIC_DEFS[4]["criteria"],
+        evaluation_steps=OUTPUT_METRIC_DEFS[4]["steps"],
+        evaluation_params=[LLMTestCaseParams.INPUT, LLMTestCaseParams.ACTUAL_OUTPUT],
+        model=eval_model,
+        threshold=0.5,
+        async_mode=False,
+    )
+    _ctx_precision = GEval(
+        name="Context Precision",
+        criteria=OUTPUT_METRIC_DEFS[5]["criteria"],
+        evaluation_steps=OUTPUT_METRIC_DEFS[5]["steps"],
+        evaluation_params=[LLMTestCaseParams.INPUT, LLMTestCaseParams.ACTUAL_OUTPUT],
+        model=eval_model,
+        threshold=0.5,
+        async_mode=False,
+    )
+
+    return [
+        AnswerRelevancyMetric(model=eval_model, threshold=0.5, async_mode=False),
+        HallucinationMetric(model=eval_model, threshold=0.5, async_mode=False),
+        BiasMetric(model=eval_model, threshold=0.5, async_mode=False),
+        ToxicityMetric(model=eval_model, threshold=0.5, async_mode=False),
+        _conciseness,
+        _ctx_precision,
+    ]
+
+
+def _measure_metrics(metrics, test_case) -> dict[str, dict[str, Any]]:
+    """Run metric.measure() for each metric and collect results."""
+    results: dict[str, dict[str, Any]] = {}
+    for metric in metrics:
+        name = _metric_name(metric)
+        try:
+            metric.measure(test_case)
+            results[name] = {
+                "score": round(metric.score, 4),
+                "reason": metric.reason or "",
+                "passed": metric.score >= metric.threshold,
+            }
+        except Exception as exc:
+            results[name] = {
+                "score": 0.0,
+                "reason": f"Error: {exc}",
+                "passed": False,
+            }
+    return results
+
+
+def run_evaluation(
+    prompt_text: str, provider: str, model: str = ""
+) -> dict[str, dict[str, Any]]:
+    """Score a prompt across all INPUT metrics using the chosen provider/model.
+
+    Returns:
+        Dict mapping metric name -> {"score": float, "reason": str, "passed": bool}.
+    """
+    from deepeval.test_case import LLMTestCase
+
+    _check_api_key(provider)
+    model_str = _resolve_model(provider, model)
+
+    test_case = LLMTestCase(input=prompt_text, actual_output=prompt_text)
+    metrics = _build_input_metrics(provider, model_str)
+
+    return _measure_metrics(metrics, test_case)
+
+
+def run_output_evaluation(
+    prompt_text: str,
+    response_text: str,
+    provider: str,
+    model: str = "",
+) -> dict[str, dict[str, Any]]:
+    """Score the LLM's response across OUTPUT quality metrics.
+
+    Metrics: Answer Relevancy, Hallucination, Bias, Toxicity,
+             Conciseness (GEval), Context Precision (GEval).
+    """
+    from deepeval.test_case import LLMTestCase
+
+    _check_api_key(provider)
+    model_str = _resolve_model(provider, model)
+
+    test_case = LLMTestCase(
+        input=prompt_text,
+        actual_output=response_text,
+        context=[prompt_text],
+        retrieval_context=[prompt_text],
+    )
+
+    metrics = _build_output_metrics(provider, model_str)
+    return _measure_metrics(metrics, test_case)
+
+
+def run_full_evaluation(
+    prompt_text: str,
+    provider: str,
+    model: str = "",
+) -> dict[str, Any]:
+    """Run the complete evaluation pipeline: input metrics + LLM response + output metrics.
+
+    Returns:
+        {
+            "input_scores":   { metric_name: {score, reason, passed}, ... },
+            "output_scores":  { metric_name: {score, reason, passed}, ... },
+            "response_text":  str,
+            "input_elapsed":  float,
+            "output_elapsed": float,
+            "errors":         [str, ...],
+        }
+    """
+    import time
+
+    _check_api_key(provider)
+    model_str = _resolve_model(provider, model)
+
+    errors: list[str] = []
+
+    # Step 1: Input evaluation
+    start = time.time()
+    input_scores: dict[str, dict[str, Any]] = {}
+    try:
+        input_scores = run_evaluation(prompt_text, provider, model_str)
+    except Exception as exc:
+        errors.append(f"Input evaluation failed: {exc}")
+    input_elapsed = time.time() - start
+
+    # Step 2: Generate LLM response
+    response_text = ""
+    try:
+        response_text = generate_prompt_response(prompt_text, provider, model_str)
+    except Exception as exc:
+        response_text = f"[Could not generate response: {exc}]"
+        errors.append(f"Response generation failed: {exc}")
+
+    # Step 3: Output evaluation
+    start = time.time()
+    output_scores: dict[str, dict[str, Any]] = {}
+    if response_text and not response_text.startswith("[Could not"):
+        try:
+            output_scores = run_output_evaluation(
+                prompt_text, response_text, provider, model_str,
+            )
+        except Exception as exc:
+            errors.append(f"Output evaluation failed: {exc}")
+    output_elapsed = time.time() - start
+
+    return {
+        "input_scores": input_scores,
+        "output_scores": output_scores,
+        "response_text": response_text,
+        "input_elapsed": input_elapsed,
+        "output_elapsed": output_elapsed,
+        "errors": errors,
+    }
+
 
 # ---------------------------------------------------------------------------
 # Generate actual LLM response (needed before output evaluation)
@@ -723,82 +620,210 @@ def generate_prompt_response(prompt_text: str, provider: str, model: str) -> str
 
 
 # ---------------------------------------------------------------------------
-# Output evaluation — scores the LLM response
+# Prompt refinement
 # ---------------------------------------------------------------------------
 
 
-def run_output_evaluation(
-    prompt_text: str,
-    response_text: str,
-    provider: str,
-    model: str = "",
-) -> dict[str, dict[str, Any]]:
-    """Score the LLM's response across output quality metrics.
+def refine_prompt(prompt_text: str, provider: str, model: str = "") -> str:
+    """Call the LLM to produce an improved version of the user's prompt."""
+    return _refine_with_system(prompt_text, provider, model, REFINEMENT_SYSTEM_PROMPT)
 
-    Metrics: Answer Relevancy, Hallucination, Bias, Toxicity,
-             Conciseness (GEval), Context Precision (GEval).
+
+def refine_skill(
+    skill_text: str, provider: str, model: str = "", context: str = "",
+) -> str:
+    """Call the LLM to review and improve a Skill / Agent / Subagent definition.
+
+    Unlike refine_prompt(), this treats the content as an agent skill file
+    (SKILL.md, agent config, subagent definition) and focuses on trigger clarity,
+    instruction completeness, token efficiency, and structure.
+
+    Args:
+        skill_text: The full skill/agent file content.
+        provider:   "OpenAI", "Anthropic", or "Google".
+        model:      Specific model to use.
+        context:    Optional additional context (e.g. JIRA ticket, requirements)
+                    that helps the LLM understand the skill's intended use case.
     """
-    from deepeval.metrics import (
-        AnswerRelevancyMetric,
-        BiasMetric,
-        HallucinationMetric,
-        ToxicityMetric,
-    )
-    from deepeval.metrics import GEval
-    from deepeval.test_case import LLMTestCase, LLMTestCaseParams
+    user_msg = skill_text
+    if context.strip():
+        user_msg = (
+            f"## Additional Context\n"
+            f"The following context describes the real-world use case, requirements, "
+            f"or ticket this skill/agent is designed for. Use this to make the "
+            f"refinement more accurate and domain-specific:\n\n"
+            f"{context.strip()}\n\n"
+            f"---\n\n"
+            f"## Skill / Agent Definition to Refine\n\n"
+            f"{skill_text}"
+        )
+    return _refine_with_system(user_msg, provider, model, SKILL_REFINEMENT_SYSTEM_PROMPT)
 
+
+def _refine_with_system(
+    text: str, provider: str, model: str, system_prompt: str,
+) -> str:
+    """Shared refinement logic — calls the LLM with the given system prompt."""
+    _check_api_key(provider)
     model_str = _resolve_model(provider, model)
-    eval_model = _make_eval_model(provider, model_str)
 
-    test_case = LLMTestCase(
-        input=prompt_text,
-        actual_output=response_text,
-        context=[prompt_text],
-        retrieval_context=[prompt_text],
+    if provider == "OpenAI":
+        return _refine_openai(text, model_str, system_prompt)
+    if provider == "Google":
+        return _refine_google(text, model_str, system_prompt)
+    return _refine_anthropic(text, model_str, system_prompt)
+
+
+def _refine_openai(text: str, model_str: str, system_prompt: str) -> str:
+    from openai import OpenAI
+
+    client = OpenAI()
+    response = client.chat.completions.create(
+        model=model_str,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": text},
+        ],
+        temperature=0.4,
+        max_tokens=4096,
     )
+    return response.choices[0].message.content or ""
 
-    _conciseness = GEval(
-        name="Conciseness",
-        criteria=OUTPUT_METRIC_DEFS[4]["criteria"],
-        evaluation_steps=OUTPUT_METRIC_DEFS[4]["steps"],
-        evaluation_params=[LLMTestCaseParams.INPUT, LLMTestCaseParams.ACTUAL_OUTPUT],
-        model=eval_model,
-        threshold=0.5,
-        async_mode=False,
+
+def _refine_anthropic(text: str, model_str: str, system_prompt: str) -> str:
+    from anthropic import Anthropic
+
+    client = Anthropic()
+    response = client.messages.create(
+        model=model_str,
+        system=system_prompt,
+        messages=[{"role": "user", "content": text}],
+        temperature=0.4,
+        max_tokens=4096,
     )
-    _ctx_precision = GEval(
-        name="Context Precision",
-        criteria=OUTPUT_METRIC_DEFS[5]["criteria"],
-        evaluation_steps=OUTPUT_METRIC_DEFS[5]["steps"],
-        evaluation_params=[LLMTestCaseParams.INPUT, LLMTestCaseParams.ACTUAL_OUTPUT],
-        model=eval_model,
-        threshold=0.5,
-        async_mode=False,
+    return response.content[0].text
+
+
+def _refine_google(text: str, model_str: str, system_prompt: str) -> str:
+    from google import genai
+
+    client = genai.Client(api_key=os.environ.get("GOOGLE_API_KEY"))
+    response = client.models.generate_content(
+        model=model_str,
+        contents=f"{system_prompt}\n\n{text}",
+        config={
+            "temperature": 0.4,
+            "max_output_tokens": 4096,
+        },
     )
+    return response.text or ""
 
-    metrics = [
-        AnswerRelevancyMetric(model=eval_model, threshold=0.5, async_mode=False),
-        HallucinationMetric(model=eval_model, threshold=0.5, async_mode=False),
-        BiasMetric(model=eval_model, threshold=0.5, async_mode=False),
-        ToxicityMetric(model=eval_model, threshold=0.5, async_mode=False),
-        _conciseness,
-        _ctx_precision,
-    ]
 
-    results: dict[str, dict[str, Any]] = {}
-    for metric in metrics:
+# ---------------------------------------------------------------------------
+# Token pricing
+# ---------------------------------------------------------------------------
+
+
+def _count_tokens_openai(text: str, model: str) -> int:
+    import tiktoken
+
+    try:
+        enc = tiktoken.encoding_for_model(model)
+    except KeyError:
+        enc = tiktoken.get_encoding("o200k_base")
+    return len(enc.encode(text))
+
+
+def _count_tokens_anthropic(text: str, model: str) -> int:
+    from anthropic import Anthropic
+
+    client = Anthropic()
+    resp = client.messages.count_tokens(
+        model=model,
+        messages=[{"role": "user", "content": text}],
+    )
+    return resp.input_tokens
+
+
+def _count_tokens_google(text: str, model: str) -> int:
+    from google import genai
+
+    client = genai.Client(api_key=os.environ.get("GOOGLE_API_KEY"))
+    resp = client.models.count_tokens(model=model, contents=text)
+    return resp.total_tokens
+
+
+def calculate_token_pricing(
+    prompt_text: str,
+) -> list[dict[str, Any]]:
+    """Calculate token counts and costs for ALL models across all providers."""
+    results: list[dict[str, Any]] = []
+
+    has_anthropic = bool(os.environ.get("ANTHROPIC_API_KEY"))
+    has_google = bool(os.environ.get("GOOGLE_API_KEY"))
+
+    def _tiktoken_approx(text: str) -> int:
+        import tiktoken
+        enc = tiktoken.get_encoding("o200k_base")
+        return len(enc.encode(text))
+
+    for model in OPENAI_MODELS:
         try:
-            metric.measure(test_case)
-            results[metric.name] = {
-                "score": round(metric.score, 4),
-                "reason": metric.reason or "",
-                "passed": metric.score >= metric.threshold,
-            }
+            tokens = _count_tokens_openai(prompt_text, model)
+            pricing = MODEL_PRICING[model]
+            results.append({
+                "provider": "OpenAI",
+                "model": model,
+                "tokens": tokens,
+                "input_cost": round(tokens * pricing["input"] / 1_000_000, 6),
+                "output_cost": round(tokens * pricing["output"] / 1_000_000, 6),
+            })
         except Exception as exc:
-            results[metric.name] = {
-                "score": 0.0,
-                "reason": f"Error: {exc}",
-                "passed": False,
-            }
+            results.append({
+                "provider": "OpenAI", "model": model, "tokens": 0,
+                "input_cost": 0.0, "output_cost": 0.0, "error": str(exc),
+            })
+
+    for model in ANTHROPIC_MODELS:
+        try:
+            if has_anthropic:
+                tokens = _count_tokens_anthropic(prompt_text, model)
+            else:
+                tokens = _tiktoken_approx(prompt_text)
+            pricing = MODEL_PRICING[model]
+            results.append({
+                "provider": "Anthropic",
+                "model": model,
+                "tokens": tokens,
+                "input_cost": round(tokens * pricing["input"] / 1_000_000, 6),
+                "output_cost": round(tokens * pricing["output"] / 1_000_000, 6),
+                **({"source": "approx"} if not has_anthropic else {}),
+            })
+        except Exception as exc:
+            results.append({
+                "provider": "Anthropic", "model": model, "tokens": 0,
+                "input_cost": 0.0, "output_cost": 0.0, "error": str(exc),
+            })
+
+    for model in GOOGLE_MODELS:
+        try:
+            if has_google:
+                tokens = _count_tokens_google(prompt_text, model)
+            else:
+                tokens = _tiktoken_approx(prompt_text)
+            pricing = MODEL_PRICING[model]
+            results.append({
+                "provider": "Google",
+                "model": model,
+                "tokens": tokens,
+                "input_cost": round(tokens * pricing["input"] / 1_000_000, 6),
+                "output_cost": round(tokens * pricing["output"] / 1_000_000, 6),
+                **({"source": "approx"} if not has_google else {}),
+            })
+        except Exception as exc:
+            results.append({
+                "provider": "Google", "model": model, "tokens": 0,
+                "input_cost": 0.0, "output_cost": 0.0, "error": str(exc),
+            })
 
     return results
